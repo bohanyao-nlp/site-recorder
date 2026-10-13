@@ -14,7 +14,8 @@ You need Google Chrome or Microsoft Edge, and an internet connection for the fir
 
 Get the files in one of two ways:
 - unzip the `site-recorder-<version>.zip` the study team sent you;
-- or clone this repository (`git clone <repo-url> site-recorder`).
+- or clone this repository: `git clone https://github.com/bohanyao-nlp/site-recorder.git` (private;
+  ask the study team for access).
 
 Then, in that folder:
 
