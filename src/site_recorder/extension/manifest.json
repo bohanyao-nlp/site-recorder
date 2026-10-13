@@ -1,0 +1,65 @@
+{
+  "manifest_version": 3,
+  "name": "SITE Collector",
+  "version": "1.8.0",
+  "description": "SITE-Bench recorder: captures network traffic, screenshots, DOM snapshots, and interactions while a SITE Recorder session is active.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAomACb+Y2lTOLYiJI5VtJqvpwT0wkLLRI5yAKa/t1dv5NE1FB7QuT8geBoDGGTXnGQmxWjSMHf7BY801wtSIVrVz3Hv5GEpZv+5M+sjqS/rtjjBOQP/PQqSjCXHbTym66nrSWoD4H692DtKxSSZoB8m6690A0SCD5SmLAzg1NVquV0nfqm9YhQQJb4Hjdc5Rh47JJWnX5jVez/4ERCDqCWooSDP7f7RaaNxlVjgO7fHxmIKaHNuvb6dnokwl15/1841PtoFC+A+DUWr5vkas7O/+PnGHJKV+wzxuyqGauso10yTc3n08VsxFyRu+lVUfafpKikKUkoZMyA0GzA6KqjwIDAQAB",
+  "icons": {
+    "16": "icon_16.png",
+    "32": "icon_32.png",
+    "48": "icon_48.png",
+    "128": "icon_128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icon_idle_16.png",
+      "32": "icon_idle_32.png"
+    },
+    "default_title": "SITE Collector",
+    "default_popup": "popup.html"
+  },
+  "permissions": [
+    "alarms",
+    "debugger",
+    "downloads",
+    "nativeMessaging",
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "file:///*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "match_about_blank": true,
+      "match_origin_as_fallback": true
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "js": [
+        "main_world.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

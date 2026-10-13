@@ -1,0 +1,8 @@
+# Exact versions the recorder was tested with. The installers pass this to
+# `uv tool install --constraints`, so every participant gets the same
+# dependency set regardless of later PyPI releases.
+warcio==1.8.1
+six==1.17.0
+psutil==7.2.2
+pillow==12.3.0
+setuptools==80.9.0
