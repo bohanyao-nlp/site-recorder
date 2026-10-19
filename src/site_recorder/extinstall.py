@@ -260,20 +260,6 @@ def _reload(browser: str, log) -> tuple[bool, str]:
         _wait_gone(browser, timeout=20)
 
 
-def launch_with_temporary_extension(browser: str, log=print):
-    """TEST ONLY: start the recording browser with the bundled extension loaded
-    for this launch only. ``Extensions.loadUnpacked`` installs are purged at
-    the next normal start, and the pipe flags make ``navigator.webdriver``
-    true — never use this for real recordings. Must run in a process that owns
-    nothing at fds 3/4. Returns (pid, pipe); closing the pipe ends the browser."""
-    from .recorder import ensure_extension_copy
-    ext = ensure_extension_copy()
-    pid, pipe = _launch_debuggable(browser, log)
-    res = pipe.send("Extensions.loadUnpacked", {"path": str(ext)}, timeout=40)
-    log(f"temporarily loaded extension id {res.get('id')}")
-    return pid, pipe
-
-
 def _wait_gone(browser: str, timeout: float) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline and browsers.is_running(browser):

@@ -71,12 +71,8 @@ if command -v pgrep >/dev/null 2>&1 && pgrep -f "site_recorder\.gui|site-recorde
 fi
 
 # --- 2. the recorder --------------------------------------------------------
-# A release zip carries a prebuilt wheel (no build step on the participant's
-# machine); a source checkout is built with pinned build tools.
+# Built from this folder with pinned build tools.
 SOURCE="$HERE"
-for w in "$HERE"/wheel/*.whl; do
-  if [ -f "$w" ]; then SOURCE="$w"; fi
-done
 
 # Keep the first Python build that installs AND runs (interpreter + Tk + the
 # compiled dependencies + the recorder). 3.13 first: on macOS/Linux the

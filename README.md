@@ -14,7 +14,7 @@ for you, and only between **Start** and **Stop**.
 You'll need Google Chrome or Microsoft Edge, and an internet connection for the first install.
 
 Get the files in one of two ways:
-- unzip the `site-recorder-<version>.zip` I sent you, or
+- download this repo as a zip (**Code → Download ZIP**) and unzip it, or
 - clone this repo: `git clone https://github.com/bohanyao-nlp/site-recorder.git`
 
 Then, in that folder:
@@ -33,8 +33,8 @@ The installer:
   applications menu on Linux);
 - opens the app when it's done.
 
-To update to a new version, close SITE Recorder (stop any recording first), unzip the new version and
-run the installer again. Your existing recordings won't be affected.
+To update to a new version, close SITE Recorder (stop any recording first), get the new version the
+same way and run the installer again. Your existing recordings won't be affected.
 
 ## 2. One-time setup (in the app's *Setup* tab)
 
@@ -113,12 +113,30 @@ This keeps your recordings in `~/SiteRecorder`. To also delete the recording bro
 
 ## Maintainer notes (Sherry and me)
 
-- **Building the download for participants:** run `python build_release.py`. This creates
-  `dist/site-recorder-<version>.zip` (installers, a prebuilt wheel and this README), which is the file
-  participants get. It also creates `dist/site-collector-<version>-webstore.zip` for publishing the
-  extension to the Chrome Web Store.
-- **Collecting recordings on the server:** see `server/README.md`. It checks each zip, copies the sessions
-  into site-bench's `sessions/` folder, and generates the video, captions and title.
-- **Design, verified platform behavior, known limitations and tests:** see `DEVELOPER_NOTES.md`. Run the
-  unit tests with `uv run --with pytest pytest tests`. The manual tests that use a real browser are in
-  `tests/manual/`.
+**How it works.** The app (`gui.py`, or the CLI in `cli.py`) starts Chrome/Edge with its own profile in
+the app folder, so the participant's everyday browser is never touched. That profile is launched with
+`--disable-sync`, because Edge would otherwise sign it into the Windows account. The SITE Collector
+extension captures screenshots, events, DOM snapshots and network traffic, and sends them over native
+messaging to `host.py`, which writes the session folder (WARC, screenshots, `events.jsonl` and so on).
+The host only accepts a browser running the recording profile while a session is active.
+`export.py` zips a session with a SHA-256 checksum for every file.
+
+**Collecting recordings.** Ingesting happens in the site-bench repo. It verifies each zip, copies the
+session into `sessions/` and generates the video, captions and title:
+`PYTHONUTF8=1 uv run python -m site_bench.record.ingest <zips or folder> --sessions-root sessions`.
+
+**Versions.** Bump `pyproject.toml` and `src/site_recorder/__init__.py` together. Bump
+`src/site_recorder/extension/manifest.json` whenever the extension changes. For a Chrome Web Store
+upload, zip the `extension/` folder with the manifest's `"key"` removed, because the store rejects keyed
+packages. The key keeps the unpacked copy's ID equal to the store ID. The listing is owned by valteu's
+account, and the store currently has 1.7.1.
+
+**Tests.** `uv run --with pytest pytest tests`.
+
+**Known limitations.**
+- macOS and Linux were reviewed but never run on real hardware.
+- When a tab opens straight to a URL, its first page can load before the debugger attaches. Its network
+  records are then missing, but the DOM snapshot still captures the page.
+- With the bundled (unpacked) extension, Edge shows a "Turn off developer mode?" notice at each start.
+- Smart App Control can block brand-new Python builds, so `install.ps1` tries 3.12.14, then 3.13, then
+  3.11.

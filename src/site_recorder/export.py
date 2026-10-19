@@ -9,9 +9,9 @@ Layout of ``<session_id>.zip``::
         export_manifest.json           written last: versions +
                                        sha256 of every file above
 
-The server-side ingest (server/ingest.py) verifies every checksum
-before accepting a zip, so a truncated upload/download is caught instead of
-silently feeding a half session into reconstruction.
+site-bench's ingest step (site_bench.record.ingest) verifies every
+checksum before accepting a zip, so a truncated upload/download is caught
+instead of silently feeding a half session into reconstruction.
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import hashlib
 import json
 import os
 import platform
-import re
 import time
 import zipfile
 from pathlib import Path
@@ -44,7 +43,6 @@ _STORED_SUFFIXES = {".gz", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".w
                     ".zip", ".7z", ".xz", ".bz2", ".mp3", ".ogg", ".woff", ".woff2"}
 
 _CHUNK = 1 << 20
-SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
 def _iter_files(session_dir: Path) -> Iterable[Path]:
@@ -147,49 +145,3 @@ def export_info(session_dir: Path) -> dict | None:
         return json.loads((Path(session_dir) / EXPORT_MARKER).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-
-
-def verify_zip(zip_path: Path) -> tuple[bool, str, dict | None]:
-    """Check a session zip against its manifest. Returns (ok, message, manifest).
-
-    Stdlib-only on purpose: the server-side ingest imports this module by path."""
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            names = [n for n in zf.namelist() if n.endswith("/" + MANIFEST_NAME)]
-            if len(names) != 1:
-                return False, f"expected exactly one {MANIFEST_NAME}, found {len(names)}", None
-            mname = names[0]
-            root = mname[: -len(MANIFEST_NAME)]          # "<sid>/"
-            manifest = json.loads(zf.read(mname))
-            if manifest.get("format") != EXPORT_FORMAT:
-                return False, f"unknown export format {manifest.get('format')!r}", manifest
-            sid = str(manifest.get("session_id") or "")
-            # The id becomes a folder name on the server: accept only the
-            # recorder's own format, and only a zip rooted at that folder.
-            if not SESSION_ID_RE.match(sid) or root != sid + "/":
-                return False, f"bad session id / layout ({sid!r}, root {root!r})", manifest
-            present = {n for n in zf.namelist() if not n.endswith("/")}
-            listed = {root + e.get("path", "") for e in manifest.get("files", [])} | {mname}
-            extra = sorted(present - listed)
-            if extra:
-                return False, f"zip contains files not in its manifest: {extra[:3]}", manifest
-            for e in manifest.get("files", []):
-                name = root + e["path"]
-                if name not in present:
-                    return False, f"missing file {e['path']}", manifest
-                h = hashlib.sha256()
-                n = 0
-                with zf.open(name) as fh:
-                    while True:
-                        buf = fh.read(_CHUNK)
-                        if not buf:
-                            break
-                        h.update(buf)
-                        n += len(buf)
-                if n != e["size"] or h.hexdigest() != e["sha256"]:
-                    return False, f"checksum mismatch for {e['path']}", manifest
-            return True, f"{len(manifest.get('files', []))} files verified", manifest
-    except zipfile.BadZipFile as e:
-        return False, f"not a valid zip ({e})", None
-    except (OSError, ValueError, KeyError) as e:
-        return False, f"unreadable ({e})", None

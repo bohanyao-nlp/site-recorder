@@ -73,10 +73,8 @@ if ($running.Count -gt 0) {
 }
 
 # --- 2. the recorder ------------------------------------------------------------
-# A release zip carries a prebuilt wheel (no build step on the participant's
-# machine); a source checkout is built with pinned build tools.
-$wheel = Get-ChildItem -Path (Join-Path $here 'wheel') -Filter '*.whl' -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($wheel) { $source = $wheel.FullName } else { $source = $here }
+# Built from this folder with pinned build tools.
+$source = $here
 $constraints = Join-Path $here 'constraints.txt'
 
 # Windows Smart App Control (on by default on new Windows 11 installs) only lets
