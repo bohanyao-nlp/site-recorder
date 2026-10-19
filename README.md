@@ -39,9 +39,7 @@ again. Your recordings are kept.
 
 1. **Participant ID**: enter the ID the study team gave you.
 2. **Browser**: Chrome or Edge.
-3. **Install the SITE Collector extension**: click *Install from Chrome Web Store*. In the browser window
-   that opens, click **Add to Chrome**, or **Get extension** in Edge, then **Add extension**. Close that
-   window. The app should show *✓ Installed* within a few seconds.
+3. **Install the SITE Collector extension**: `https://chromewebstore.google.com/detail/site-collector/gbhaoocbgjdighlaaflhgfbmaahgmjaa`
 
    *If the Web Store is unavailable:* click *Use the bundled copy*. The app turns on Developer mode for
    you and opens the extensions page:
