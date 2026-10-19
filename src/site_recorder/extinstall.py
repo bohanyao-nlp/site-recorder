@@ -13,17 +13,21 @@ page's own API over a one-time DevTools connection, so the participant only
 has to click "Load unpacked". Recording launches never carry debugging
 switches (they would expose ``navigator.webdriver`` to websites).
 
-The DevTools pipe is file descriptors 3 (commands in) and 4 (responses out)
-of the browser process. POSIX passes them with a shell redirect; Windows
-passes C-runtime descriptors through ``os.spawnv`` (the CRT hands its fd
-table to the child, the mechanism Puppeteer/Node use). That juggles fds 3/4
-of the CALLING process, so the work runs in a fresh helper process:
-``python -m site_recorder.extinstall devmode <browser>``.
+The connection is the browser's DevTools websocket on a random localhost
+port (``--remote-debugging-port=0``; the browser writes the port to
+``<profile>/DevToolsActivePort``). Not ``--remote-debugging-pipe``: Edge 155
+relaunches itself at startup, and the relaunched browser never starts when
+the launcher was given a pipe. The work runs in a helper process
+(``python -m site_recorder.extinstall devmode <browser>``) so a hung browser
+can be timed out without blocking the GUI.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -35,39 +39,96 @@ from . import browsers, paths
 RESULT_PREFIX = "EXTINSTALL_RESULT "
 
 
-class _Pipe:
-    def __init__(self, wfd: int, rfd: int):
-        self.w = os.fdopen(wfd, "wb", buffering=0)
-        self.r = os.fdopen(rfd, "rb", buffering=0)
+def _mask(data: bytes, key: bytes) -> bytes:
+    n = len(data)
+    k = (key * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(k, "big")).to_bytes(n, "big")
+
+
+class _Cdp:
+    """Minimal CDP client over the browser-level DevTools websocket (RFC 6455,
+    stdlib only: text frames out, masked as a client must; frames in)."""
+
+    def __init__(self, port: int, path: str, timeout: float = 10.0):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        # No Origin header: the browser only checks origins of clients that send one.
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        self.r = self.sock.makefile("rb")
+        status = self.r.readline()
+        while self.r.readline() not in (b"\r\n", b""):
+            pass
+        if b" 101 " not in status:
+            self.close()
+            raise RuntimeError(f"DevTools refused the connection: {status.decode(errors='replace').strip()}")
+        self.sock.settimeout(None)
+        self.wlock = threading.Lock()
         self.pending: dict[int, dict] = {}
         self.cv = threading.Condition()
         self.next_id = 1
         self.closed = False
         threading.Thread(target=self._reader, daemon=True).start()
 
+    def _read(self, n: int) -> bytes:
+        data = self.r.read(n)
+        if len(data) < n:
+            raise OSError("connection closed")
+        return data
+
+    def _write(self, opcode: int, payload: bytes) -> None:
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        key = os.urandom(4)
+        with self.wlock:
+            self.sock.sendall(head + key + _mask(payload, key))
+
     def _reader(self) -> None:
-        buf = b""
-        while True:
-            try:
-                chunk = self.r.read(65536)
-            except OSError:
-                chunk = b""
-            if not chunk:
-                with self.cv:
-                    self.closed = True
-                    self.cv.notify_all()
-                return
-            buf += chunk
-            while b"\0" in buf:
-                raw, buf = buf.split(b"\0", 1)
+        msg = b""
+        try:
+            while True:
+                b0, b1 = self._read(2)
+                n = b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                key = self._read(4) if b1 & 0x80 else b""
+                data = self._read(n)
+                if key:
+                    data = _mask(data, key)
+                op = b0 & 0x0F
+                if op == 0x8:                       # close
+                    break
+                if op == 0x9:                       # ping
+                    self._write(0xA, data)
+                    continue
+                if op not in (0x0, 0x1, 0x2):
+                    continue
+                msg += data
+                if not b0 & 0x80:                   # more fragments follow
+                    continue
+                raw, msg = msg, b""
                 try:
-                    msg = json.loads(raw)
+                    m = json.loads(raw)
                 except ValueError:
                     continue
-                if "id" in msg:
+                if "id" in m:
                     with self.cv:
-                        self.pending[msg["id"]] = msg
+                        self.pending[m["id"]] = m
                         self.cv.notify_all()
+        except (OSError, ValueError):
+            pass
+        with self.cv:
+            self.closed = True
+            self.cv.notify_all()
 
     def send(self, method: str, params: dict | None = None, session: str | None = None,
              timeout: float = 20.0) -> dict:
@@ -76,7 +137,10 @@ class _Pipe:
         m = {"id": mid, "method": method, "params": params or {}}
         if session:
             m["sessionId"] = session
-        self.w.write(json.dumps(m).encode() + b"\0")
+        try:
+            self._write(0x1, json.dumps(m).encode())
+        except OSError:
+            raise TimeoutError(f"{method}: the browser closed the connection") from None
         deadline = time.time() + timeout
         with self.cv:
             while mid not in self.pending:
@@ -90,85 +154,29 @@ class _Pipe:
         return resp.get("result", {})
 
     def close(self) -> None:
-        for f in (self.w, self.r):
+        for f in (self.r, self.sock):
             try:
                 f.close()
             except OSError:
                 pass
 
 
-def _spawn_with_pipe(cmd: list[str]) -> tuple[int, _Pipe]:
-    """Start the browser with DevTools pipe fds 3 (in) and 4 (out)."""
-    if sys.platform == "win32":
-        # Occupy every free descriptor up to 4 with placeholders FIRST, so the
-        # pipes below can never be allocated at 3/4 themselves (aliasing them
-        # would hand the browser our own ends). Single-threaded here.
-        held = []
-        while True:
-            fd = os.open(os.devnull, os.O_RDWR)
-            if fd > 4:
-                os.close(fd)
-                break
-            held.append(fd)
-        saved = {fd: os.dup(fd) for fd in (3, 4) if fd not in held}   # pre-existing files
-        to_b_r, to_b_w = os.pipe()       # we write commands -> browser reads fd 3
-        from_b_r, from_b_w = os.pipe()   # browser writes fd 4 -> we read
-        os.dup2(to_b_r, 3, inheritable=True)
-        os.dup2(from_b_w, 4, inheritable=True)
-        # The browser's stdio -> null (it logs a lot), restored right after.
-        sys.stdout.flush()
-        sys.stderr.flush()
-        null = os.open(os.devnull, os.O_RDWR)
-        std_saved = {}
-        for fd in (0, 1, 2):
-            try:
-                std_saved[fd] = os.dup(fd)
-            except OSError:
-                std_saved[fd] = None
-            os.dup2(null, fd, inheritable=True)
+def _devtools_endpoint(port_file: Path, timeout: float) -> tuple[int, str]:
+    """(port, browser websocket path) from the profile's DevToolsActivePort."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            args = [subprocess.list2cmdline([a]) for a in cmd]
-            handle = os.spawnv(os.P_NOWAIT, cmd[0], args)   # CRT passes fds 0-4
-        finally:
-            for fd, orig in std_saved.items():
-                if orig is not None:
-                    os.dup2(orig, fd, inheritable=True)
-                    os.close(orig)
-            os.close(null)
-            for fd in (3, 4):
-                if fd in saved:
-                    orig = saved.pop(fd)
-                    os.dup2(orig, fd, inheritable=False)
-                    os.close(orig)
-                else:
-                    os.close(fd)
-            for fd in held:
-                if fd not in (3, 4):
-                    os.close(fd)
-        pid = _pid_from_handle(handle)
-    else:
-        to_b_r, to_b_w = os.pipe()       # we write commands -> browser reads fd 3
-        from_b_r, from_b_w = os.pipe()   # browser writes fd 4 -> we read
-        sh = ["/bin/sh", "-c", f'exec "$0" "$@" 3<&{to_b_r} 4>&{from_b_w}', *cmd]
-        p = subprocess.Popen(sh, pass_fds=(to_b_r, from_b_w), stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True)
-        pid = p.pid
-    os.close(to_b_r)
-    os.close(from_b_w)
-    return pid, _Pipe(to_b_w, from_b_r)
+            lines = port_file.read_text(encoding="utf-8").splitlines()
+            if len(lines) >= 2 and lines[1].startswith("/devtools/browser/"):
+                return int(lines[0]), lines[1]
+        except (OSError, ValueError):
+            pass                              # not written (completely) yet
+        time.sleep(0.25)
+    raise TimeoutError("the browser did not open a DevTools port")
 
 
-def _pid_from_handle(handle: int) -> int:
-    try:
-        import ctypes
-        return int(ctypes.windll.kernel32.GetProcessId(ctypes.c_void_p(handle)))
-    except Exception:
-        return 0
-
-
-def _launch_debuggable(browser: str, log):
-    """Start the recording browser with a DevTools pipe (setup/test only)."""
+def _launch_debuggable(browser: str, log) -> _Cdp:
+    """Start the recording browser with a DevTools port (setup/test only)."""
     exe = browsers.find_executable(browser)
     if not exe:
         raise RuntimeError(f"{browsers.DISPLAY_NAME[browser]} is not installed")
@@ -177,26 +185,45 @@ def _launch_debuggable(browser: str, log):
     browsers.seed_profile(browser)
     profile = paths.profile_dir(browser)
     browsers._clear_stale_singleton(profile)
+    port_file = profile / "DevToolsActivePort"
+    port_file.unlink(missing_ok=True)         # a previous run's port
+    # Port 0: the browser picks a free port and, outside headless mode,
+    # listens on 127.0.0.1 only.
     cmd = [exe, f"--user-data-dir={profile}", *browsers.BASE_FLAGS,
-           "--remote-debugging-pipe", "--enable-unsafe-extension-debugging", "about:blank"]
+           "--remote-debugging-port=0", "--enable-unsafe-extension-debugging", "about:blank"]
     if sys.platform.startswith("linux"):
         cmd.insert(-1, "--password-store=basic")
-    log(f"launching {browsers.DISPLAY_NAME[browser]} with a DevTools pipe")
-    pid, pipe = _spawn_with_pipe(cmd)
-    ver = pipe.send("Browser.getVersion", timeout=40)
+    log(f"launching {browsers.DISPLAY_NAME[browser]} with a DevTools port")
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL, "env": browsers._browser_env(),
+                    "cwd": str(Path.home())}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    # The launched process may only hand over to a relaunched browser (Edge),
+    # so the browser is found by its profile afterwards, not by this pid.
+    subprocess.Popen(cmd, **kwargs)
+    try:
+        port, path = _devtools_endpoint(port_file, timeout=40)
+        cdp = _Cdp(port, path)
+        ver = cdp.send("Browser.getVersion")
+    except Exception:
+        browsers.close(browser, timeout=10)
+        raise
     log(f"connected to {ver.get('product')}")
-    return pid, pipe
+    return cdp
 
 
-def _set_developer_mode(pipe: _Pipe, browser: str, log) -> str:
+def _set_developer_mode(cdp: _Cdp, browser: str, log) -> str:
     """developerPrivate.updateProfileConfiguration on the extensions page —
     exactly what clicking the page's Developer-mode toggle does."""
     scheme = "edge" if browser == "edge" else "chrome"
-    tgt = pipe.send("Target.createTarget", {"url": f"{scheme}://extensions/"})
-    sess = pipe.send("Target.attachToTarget", {"targetId": tgt["targetId"], "flatten": True})["sessionId"]
+    tgt = cdp.send("Target.createTarget", {"url": f"{scheme}://extensions/"})
+    sess = cdp.send("Target.attachToTarget", {"targetId": tgt["targetId"], "flatten": True})["sessionId"]
     dm = "?"
     for _ in range(30):
-        r = pipe.send("Runtime.evaluate", {
+        r = cdp.send("Runtime.evaluate", {
             "expression": "(chrome.developerPrivate ? chrome.developerPrivate"
                           ".updateProfileConfiguration({inDeveloperMode: true})"
                           ".then(() => 'ok').catch(e => 'ERR ' + e.message) : 'notready')",
@@ -207,19 +234,19 @@ def _set_developer_mode(pipe: _Pipe, browser: str, log) -> str:
         time.sleep(0.5)
     log(f"developer mode: {dm}")
     try:
-        pipe.send("Target.closeTarget", {"targetId": tgt["targetId"]})
+        cdp.send("Target.closeTarget", {"targetId": tgt["targetId"]})
     except Exception:
         pass
     return dm
 
 
 def _devmode(browser: str, log) -> tuple[bool, str]:
-    pid, pipe = _launch_debuggable(browser, log)
+    cdp = _launch_debuggable(browser, log)
     try:
-        dm = _set_developer_mode(pipe, browser, log)
+        dm = _set_developer_mode(cdp, browser, log)
         time.sleep(1.5)                       # let the profile persist the setting
         try:
-            pipe.send("Browser.close", timeout=10)
+            cdp.send("Browser.close", timeout=10)
         except Exception:
             pass
         if dm == "ok":
@@ -233,14 +260,14 @@ def _reload(browser: str, log) -> tuple[bool, str]:
     """developerPrivate.reload of the unpacked extension — what its Reload
     button does: re-reads the files and re-registers the service worker."""
     from . import EXTENSION_ID
-    pid, pipe = _launch_debuggable(browser, log)
+    cdp = _launch_debuggable(browser, log)
     try:
         scheme = "edge" if browser == "edge" else "chrome"
-        tgt = pipe.send("Target.createTarget", {"url": f"{scheme}://extensions/"})
-        sess = pipe.send("Target.attachToTarget", {"targetId": tgt["targetId"], "flatten": True})["sessionId"]
+        tgt = cdp.send("Target.createTarget", {"url": f"{scheme}://extensions/"})
+        sess = cdp.send("Target.attachToTarget", {"targetId": tgt["targetId"], "flatten": True})["sessionId"]
         res = "?"
         for _ in range(30):
-            r = pipe.send("Runtime.evaluate", {
+            r = cdp.send("Runtime.evaluate", {
                 "expression": "(chrome.developerPrivate ? chrome.developerPrivate"
                               f".reload('{EXTENSION_ID}', {{failQuietly: true}})"
                               ".then(() => 'ok').catch(e => 'ERR ' + (e && e.message || e)) : 'notready')",
@@ -252,7 +279,7 @@ def _reload(browser: str, log) -> tuple[bool, str]:
         log(f"reload: {res}")
         time.sleep(2.0)                       # let the new worker register + prefs persist
         try:
-            pipe.send("Browser.close", timeout=10)
+            cdp.send("Browser.close", timeout=10)
         except Exception:
             pass
         return (res == "ok"), ("reloaded" if res == "ok" else f"reload failed ({res})")

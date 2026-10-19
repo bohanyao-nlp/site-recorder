@@ -265,3 +265,59 @@ def test_stamped_extension_version_changes_with_code(home):
     m = (src / "manifest.json").read_bytes()
     v_again = json.loads(recorder._stamped_manifest(m, files))["version"]
     assert v_again == v1                                           # deterministic
+
+
+def test_cdp_websocket_client():
+    """extinstall._Cdp against a fake DevTools server: handshake, masked
+    client frames, a fragmented reply with 64-bit lengths, errors, close."""
+    import socket
+    import struct
+    import threading
+    from site_recorder import extinstall
+
+    srv = socket.create_server(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    seen = []
+
+    def serve():
+        c, _ = srv.accept()
+        f = c.makefile("rb")
+        assert f.readline().startswith(b"GET /devtools/browser/x ")
+        while f.readline() != b"\r\n":
+            pass
+        c.sendall(b"HTTP/1.1 101 WebSocket Protocol Handshake\r\n\r\n")
+        for _ in range(2):
+            b0, b1 = f.read(2)
+            assert b0 == 0x81 and b1 & 0x80              # final text frame, masked
+            key = f.read(4)
+            req = json.loads(extinstall._mask(f.read(b1 & 0x7F), key))
+            seen.append(req)
+            if req["method"] == "Big.echo":
+                body = json.dumps({"id": req["id"], "result": {"v": "x" * 70000}}).encode()
+                c.sendall(bytes([0x01, 127]) + struct.pack(">Q", 10) + body[:10]
+                          + bytes([0x80, 127]) + struct.pack(">Q", len(body) - 10) + body[10:])
+            else:
+                body = json.dumps({"id": req["id"], "error": {"message": "nope"}}).encode()
+                c.sendall(bytes([0x81, len(body)]) + body)
+        c.close()
+    threading.Thread(target=serve, daemon=True).start()
+
+    cdp = extinstall._Cdp(port, "/devtools/browser/x")
+    assert cdp.send("Big.echo", {"a": 1}, session="s1", timeout=5)["v"] == "x" * 70000
+    with pytest.raises(RuntimeError, match="nope"):
+        cdp.send("Bad.call", timeout=5)
+    assert seen[0] == {"id": 1, "method": "Big.echo", "params": {"a": 1}, "sessionId": "s1"}
+    with pytest.raises(TimeoutError):                     # server closed the socket
+        cdp.send("After.close", timeout=5)
+    cdp.close()
+    srv.close()
+
+
+def test_devtools_endpoint_parses_port_file(tmp_path):
+    from site_recorder import extinstall
+    f = tmp_path / "DevToolsActivePort"
+    f.write_text("51234\n/devtools/browser/abc-123")
+    assert extinstall._devtools_endpoint(f, timeout=1) == (51234, "/devtools/browser/abc-123")
+    f.write_text("51234\n")                              # half-written: keep waiting
+    with pytest.raises(TimeoutError):
+        extinstall._devtools_endpoint(f, timeout=0.5)
