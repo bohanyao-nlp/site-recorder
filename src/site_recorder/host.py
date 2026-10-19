@@ -16,7 +16,8 @@ sessions unchanged):
     events.jsonl                  event metadata (screenshot payload stripped)
     tab_timeline.jsonl            tab activations / window focus
     dom_snapshots/                rendered-DOM HTML + index.jsonl
-    websocket_frames.jsonl        received WebSocket frames
+    layout_snapshots/             CDP DOMSnapshot (boxes + styles), .json.gz + index.jsonl
+    websocket_frames.jsonl        WebSocket frames (both directions), socket events, SSE messages
     downloads/ uploads/ local_files/   user files + manifests
     live_stats.json  status.json  extension_host.log
 
@@ -62,6 +63,7 @@ from collections import OrderedDict
 from . import __version__
 from .fsutil import FileLock, atomic_write_text
 from .fsutil import read_json as _read_json
+from .redact import Redactor, load_or_create_key
 
 # Frames on the wire: 4-byte native-endian length + UTF-8 JSON. Chrome caps
 # extension->host messages at 64 MiB; anything bigger is a framing error.
@@ -217,16 +219,26 @@ _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
 class ExtensionHost:
-    def __init__(self, session_dir: Path, channel: Channel):
+    def __init__(self, session_dir: Path, channel: Channel, app_dir: Path | None = None):
         self.session_dir = Path(session_dir)
         self.ch = channel
+        self.app_dir = Path(app_dir) if app_dir else None
+        # Credential headers / secret-named body fields / token URL params are
+        # replaced by keyed hashes before anything is written (see redact.py).
+        self.redactor = Redactor(load_or_create_key(self.app_dir))
         self.archive_dir = self.session_dir / "archive"
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.warc_path = self.archive_dir / "session.warc.gz"
         self._warned_stale_jpeg = False
-        # requestId -> (site_url, tabId, frameId) of the request, used to tag
-        # its response; bounded (a long session sees millions of requests).
-        self._requests: OrderedDict = OrderedDict()
+        # Requests are HELD until their response arrives (the extension sends
+        # a response only at loadingFinished) so the WARC gets each request
+        # immediately followed by its response — the pipeline pairs a
+        # response with the request record right before it. Keyed by
+        # tab|session|requestId; bounded (a long session sees millions).
+        self._pending_requests: OrderedDict = OrderedDict()
+        # Same key -> tagging/timing of the request, kept after it is written
+        # so a late response can still be tagged and timed.
+        self._req_meta: OrderedDict = OrderedDict()
         self._stop = threading.Event()
         self._io_lock = threading.Lock()   # status.json written from two threads
         # Serializes session writes between the reader loop and a forced
@@ -277,8 +289,12 @@ class ExtensionHost:
         paused = bool(status.get("paused"))
         # session_id + paused let the extension tell a RECONNECT (same session:
         # keep the participant's pause) from a new session.
-        self.ch.send({"type": "connected", "session_id": self.session_dir.name,
-                      "paused": paused, "host_version": __version__})
+        hello = {"type": "connected", "session_id": self.session_dir.name,
+                 "paused": paused, "host_version": __version__}
+        marker = _read_json(self.app_dir / "active_session.json") if self.app_dir else None
+        if isinstance(marker, dict) and isinstance(marker.get("skip_domains"), list):
+            hello["skip_domains"] = [str(d) for d in marker["skip_domains"]][:200]
+        self.ch.send(hello)
         if paused:
             # Re-assert explicitly: extension builds before 1.8.0 (the Web
             # Store 1.7.1) ignore "paused" in the handshake and would silently
@@ -327,6 +343,13 @@ class ExtensionHost:
                 return
             self._done = True
             self._stop.set()
+            # Requests that never got a response (failed, aborted, session end).
+            try:
+                while self._pending_requests:
+                    _, req = self._pending_requests.popitem(last=False)
+                    self._write_warc_request(req)
+            except Exception as e:
+                logging.warning(f"flushing pending requests failed: {e}")
             if self.warc_file:
                 try:
                     self.warc_file.flush()
@@ -462,16 +485,31 @@ class ExtensionHost:
                 urls.append(msg[k].get("url") or "")
         if any(_is_dashboard(u) for u in urls):
             return
+        # Credential query parameters (OAuth callbacks…) out of every URL we
+        # store — consistently, so tab timeline and WARC tags still match.
+        for k in ("url", "site_url"):
+            if isinstance(msg.get(k), str):
+                msg[k] = self.redactor.url(msg[k])
 
         if msg_type == "network_request":
-            rid = msg.get("requestId")
-            self._requests[rid] = {k: msg.get(k) for k in ("site_url", "tabId", "frameId")}
-            self._requests.move_to_end(rid)
-            while len(self._requests) > 5000:
-                self._requests.popitem(last=False)
-            self._write_warc_request(msg)
+            self._handle_network_request(msg)
         elif msg_type == "network_response":
-            self._write_warc_response(msg, self._requests.get(msg.get("requestId")))
+            key = self._resolve_key(msg)
+            req = self._pending_requests.pop(key, None)
+            req_id = self._write_warc_request(req) if req else None
+            self._write_warc_response(msg, self._req_meta.get(key), concurrent_to=req_id)
+        elif msg_type == "network_failed":
+            req = self._pending_requests.pop(self._resolve_key(msg), None)
+            if req:
+                self._write_warc_request(req, failed=str(msg.get("errorText") or "failed"))
+        elif msg_type == "layout_snapshot":
+            self._handle_layout_snapshot(msg)
+        elif msg_type in ("zoom_change", "privacy_skip"):
+            self._append_jsonl("events.jsonl", msg)
+        elif msg_type in ("websocket_event", "eventsource_message"):
+            if isinstance(msg.get("headers"), dict):
+                msg["headers"] = self.redactor.headers(msg["headers"])
+            self._append_jsonl("websocket_frames.jsonl", msg)
         elif msg_type == "browser_snapshot":
             self._handle_browser_snapshot(msg)
         elif msg_type == "dom_snapshot":
@@ -521,9 +559,16 @@ class ExtensionHost:
         timestamp = time.time()
         msg["timestamp"] = timestamp
         event_type = _SAFE_NAME.sub("_", str(msg.get("event_type") or "unknown"))[:60]
-        image_data = msg.get("image_data")
+        image_data = msg.pop("image_data", None)
 
-        self.stats["screenshots"] += 1
+        img_bytes = self._decode_image(image_data) if image_data else None
+        if img_bytes is not None:
+            img_bytes = self._redact_screenshot(img_bytes, msg)
+        if img_bytes is None and image_data:
+            msg["screenshot"] = False
+
+        if img_bytes is not None:
+            self.stats["screenshots"] += 1
         if "click" in event_type:
             self.stats["clicks"] += 1
         elif "input" in event_type:
@@ -535,16 +580,51 @@ class ExtensionHost:
         except OSError:
             pass
 
-        meta = {k: v for k, v in msg.items() if k != "image_data"}
-        self._append_jsonl("events.jsonl", meta)
+        self._append_jsonl("events.jsonl", msg)
 
-        img_bytes = self._decode_image(image_data) if image_data else None
         if img_bytes is not None:
             ss_dir = self.session_dir / "browser_screenshots"
             ss_dir.mkdir(exist_ok=True)
             out_path = ss_dir / f"{timestamp:.6f}_{event_type}.png"
             with open(out_path, "wb") as f:
                 f.write(img_bytes)
+
+    def _redact_screenshot(self, png: bytes, msg: dict) -> bytes | None:
+        """Blank the boxes of sensitive fields (card numbers, one-time codes,
+        unmasked passwords) before the screenshot touches disk. Boxes come in
+        top-viewport CSS px; the image is in device px. A screenshot showing a
+        sensitive field whose position is unknown is not kept at all."""
+        if msg.get("redact_unlocated"):
+            logging.info("screenshot dropped: sensitive field at an unknown position")
+            msg["screenshot_withheld"] = "sensitive_unlocated"
+            return None
+        rects = msg.get("redact_rects")
+        if not rects:
+            return png
+        try:
+            from PIL import Image, ImageDraw
+            img = Image.open(io.BytesIO(png))
+            img.load()
+            d = msg.get("details") if isinstance(msg.get("details"), dict) else {}
+            try:
+                vw = float(d.get("vw") or 0)
+                scale = img.width / vw if vw else float(d.get("dpr") or 1.0)
+            except (TypeError, ValueError):
+                scale = 1.0
+            draw = ImageDraw.Draw(img)
+            pad = 4
+            for r in rects:
+                x, y, w, h = (float(v) for v in r[:4])
+                draw.rectangle([(x - pad) * scale, (y - pad) * scale,
+                                (x + w + pad) * scale, (y + h + pad) * scale], fill=(128, 128, 128))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            msg["redacted_boxes"] = len(rects)
+            return buf.getvalue()
+        except Exception as e:
+            logging.error(f"screenshot redaction failed ({e}) — dropping the image")
+            msg["screenshot_withheld"] = "redaction_failed"
+            return None
 
     def _decode_image(self, image_data: str) -> bytes | None:
         try:
@@ -593,11 +673,37 @@ class ExtensionHost:
         fname = f"{self._dom_snapshot_n:05d}.html"
         # errors="replace": JS strings may carry lone surrogates.
         (snap_dir / fname).write_text(html, encoding="utf-8", errors="replace")
+        row = {"url": url, "title": msg.get("title") or "", "reason": msg.get("reason") or "",
+               "ts": msg.get("timestamp"), "file": fname, "bytes": len(html)}
+        for k in ("shadow_roots", "cssom_bytes", "env"):
+            if msg.get(k) is not None:
+                row[k] = msg[k]
         with open(snap_dir / "index.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "url": url, "title": msg.get("title") or "", "reason": msg.get("reason") or "",
-                "ts": msg.get("timestamp"), "file": fname, "bytes": len(html),
-            }) + "\n")
+            f.write(json.dumps(row) + "\n")
+
+    def _handle_layout_snapshot(self, msg: dict) -> None:
+        """CDP DOMSnapshot.captureSnapshot result, stored as the gzip the
+        extension produced: layout_snapshots/<n>.json.gz + index.jsonl."""
+        data = msg.get("data_gz_b64") or ""
+        if not data:
+            return
+        try:
+            raw = base64.b64decode(data)
+        except Exception:
+            return
+        out_dir = self.session_dir / "layout_snapshots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not hasattr(self, "_layout_n"):
+            existing = [int(p.name.split(".")[0]) for p in out_dir.glob("[0-9]*.json.gz")
+                        if p.name.split(".")[0].isdigit()]
+            self._layout_n = max(existing, default=0)
+        self._layout_n += 1
+        fname = f"{self._layout_n:05d}.json.gz"
+        (out_dir / fname).write_bytes(raw)
+        with open(out_dir / "index.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"url": msg.get("url"), "ts": msg.get("timestamp"), "tabId": msg.get("tabId"),
+                                "file": fname, "json_bytes": msg.get("bytes"),
+                                "styles": msg.get("styles")}) + "\n")
 
     # -- uploads / downloads / local files ----------------------------------------------
     def _next_upload_n(self, up_dir: Path) -> int:
@@ -708,39 +814,120 @@ class ExtensionHost:
             }) + "\n")
 
     # -- WARC --------------------------------------------------------------------------
-    def _sitebench_warc_headers(self, msg: dict) -> dict:
-        headers = {"WARC-Date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    def _handle_network_request(self, msg: dict) -> None:
+        key = _req_key(msg)
+        prev = self._pending_requests.pop(key, None)
+        if prev is not None:
+            # The same requestId again = the next hop of a redirect chain: the
+            # previous hop's request is complete, with this 3xx as its response.
+            prev_id = self._write_warc_request(prev)
+            redirect = msg.get("redirectResponse")
+            if isinstance(redirect, dict) and redirect.get("url"):
+                hop = {"type": "network_response", "response": redirect, "redirect": True,
+                       "requestId": msg.get("requestId"), "tabId": msg.get("tabId"),
+                       "sessionId": msg.get("sessionId"), "timestamp": msg.get("timestamp")}
+                self._write_warc_response(hop, self._req_meta.get(key), concurrent_to=prev_id)
+        self._pending_requests[key] = msg
+        self._req_meta[key] = {k: msg.get(k) for k in
+                               ("site_url", "tabId", "frameId", "sessionId", "wallTime", "timestamp")}
+        self._req_meta.move_to_end(key)
+        while len(self._req_meta) > 5000:
+            self._req_meta.popitem(last=False)
+        while len(self._pending_requests) > 5000:
+            _, old = self._pending_requests.popitem(last=False)
+            self._write_warc_request(old)
+
+    def _resolve_key(self, msg: dict) -> str:
+        """The request key a response/failure belongs to. A message without a
+        tab id (older extension builds) falls back to the latest request with
+        the same requestId."""
+        key = _req_key(msg)
+        if key in self._pending_requests or key in self._req_meta or msg.get("tabId") is not None:
+            return key
+        suffix = f"|{msg.get('requestId')}"
+        for table in (self._pending_requests, self._req_meta):
+            for k in reversed(table):
+                if k.endswith(suffix):
+                    return k
+        return key
+
+    @staticmethod
+    def _wall_time(msg: dict, meta: dict | None) -> float | None:
+        """Wall-clock seconds of a CDP event: the request's own wallTime, or
+        the request's wallTime shifted by the monotonic delta to this event."""
+        try:
+            if msg.get("wallTime"):
+                return float(msg["wallTime"])
+            if meta and meta.get("wallTime") and meta.get("timestamp") and msg.get("timestamp"):
+                return float(meta["wallTime"]) + float(msg["timestamp"]) - float(meta["timestamp"])
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _sitebench_warc_headers(self, msg: dict, wall: float | None = None) -> dict:
+        when = datetime.fromtimestamp(wall, timezone.utc) if wall else datetime.now(timezone.utc)
+        headers = {"WARC-Date": when.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if wall:
+            # WARC-Date is second-resolution; this is the exact event time.
+            headers["WARC-SiteBench-Wall-Time"] = f"{wall:.6f}"
         if msg.get("site_url"):
             headers["WARC-SiteBench-Site-URL"] = msg["site_url"]
         if msg.get("tabId") is not None:
             headers["WARC-SiteBench-Tab-Id"] = str(msg["tabId"])
         if msg.get("frameId") is not None:
             headers["WARC-SiteBench-Frame-Id"] = str(msg["frameId"])
+        if msg.get("sessionId"):
+            # Traffic of an auto-attached child target (cross-origin iframe, worker).
+            headers["WARC-SiteBench-Target-Session"] = str(msg["sessionId"])
+        if msg.get("typeStr"):
+            headers["WARC-SiteBench-Resource-Type"] = str(msg["typeStr"])
         return headers
 
-    def _write_warc_request(self, req_msg: dict) -> None:
+    def _write_warc_request(self, req_msg: dict, failed: str | None = None) -> str | None:
+        """Write one request record; returns its WARC-Record-ID."""
         if not self.warc_writer:
-            return
+            return None
         request = req_msg.get("request") or {}
-        url = request.get("url")
+        url = self.redactor.url(request.get("url"))
         if not url:
-            return
-        headers_list = [(str(k), str(v)) for k, v in (request.get("headers") or {}).items()]
+            return None
+        headers = self.redactor.headers(request.get("headers") or {})
+        payload = b""
+        if req_msg.get("postData") is not None:
+            ctype = next((str(v) for k, v in headers.items() if str(k).lower() == "content-type"), "")
+            text = self.redactor.body(str(req_msg["postData"]), ctype)
+            payload = text.encode("utf-8", errors="surrogatepass")
+        elif req_msg.get("postDataBase64"):
+            try:
+                payload = base64.b64decode(req_msg["postDataBase64"])
+            except Exception:
+                payload = b""
+        headers_list = [(str(k), str(v)) for k, v in headers.items()]
         status_headers = StatusAndHeaders(f"{request.get('method') or 'GET'} {url} HTTP/1.1",
                                           headers_list, protocol="HTTP/1.1")
+        warc_headers = self._sitebench_warc_headers(req_msg, self._wall_time(req_msg, None))
+        if req_msg.get("initiator"):
+            warc_headers["WARC-SiteBench-Initiator"] = json.dumps(req_msg["initiator"], separators=(",", ":"))[:4000]
+        if req_msg.get("postDataOmitted"):
+            warc_headers["WARC-SiteBench-Post-Omitted"] = str(req_msg["postDataOmitted"])
+        if failed:
+            warc_headers["WARC-SiteBench-Failed"] = failed[:200]
         record = self.warc_writer.create_warc_record(
-            url, "request", payload=io.BytesIO(b""), http_headers=status_headers,
-            warc_headers_dict=self._sitebench_warc_headers(req_msg))
+            url, "request", payload=io.BytesIO(payload), http_headers=status_headers,
+            warc_headers_dict=warc_headers)
         self._append_record(record)
+        return record.rec_headers.get_header("WARC-Record-ID")
 
-    def _write_warc_response(self, resp_msg: dict, req_msg: dict | None) -> None:
+    def _write_warc_response(self, resp_msg: dict, req_meta: dict | None,
+                             concurrent_to: str | None = None) -> None:
         if not self.warc_writer:
             return
         response = resp_msg.get("response") or {}
-        url = response.get("url")
+        url = self.redactor.url(response.get("url"))
         if not url:
             return
-        headers_list = [(str(k), str(v)) for k, v in (response.get("headers") or {}).items()]
+        headers = self.redactor.headers(response.get("headers") or {})
+        headers_list = [(str(k), str(v)) for k, v in headers.items()]
         status_headers = StatusAndHeaders(f"{response.get('status')} {response.get('statusText') or 'OK'}",
                                           headers_list, protocol="HTTP/1.1")
         body_content = b""
@@ -751,13 +938,21 @@ class ExtensionHost:
             else:
                 body_content = body_str.encode("utf-8", errors="surrogatepass")
         merged = dict(resp_msg)
-        if req_msg:
-            for k in ("site_url", "tabId", "frameId"):
-                if merged.get(k) is None and req_msg.get(k) is not None:
-                    merged[k] = req_msg.get(k)
-        warc_headers = self._sitebench_warc_headers(merged)
+        if req_meta:
+            for k in ("site_url", "tabId", "frameId", "sessionId"):
+                if merged.get(k) is None and req_meta.get(k) is not None:
+                    merged[k] = req_meta.get(k)
+        warc_headers = self._sitebench_warc_headers(merged, self._wall_time(resp_msg, req_meta))
+        if concurrent_to:
+            warc_headers["WARC-Concurrent-To"] = concurrent_to
         if resp_msg.get("bodyOmitted"):
             warc_headers["WARC-SiteBench-Body-Omitted"] = str(resp_msg["bodyOmitted"])
+        if resp_msg.get("redirect"):
+            warc_headers["WARC-SiteBench-Redirect"] = "1"
+        if resp_msg.get("failed"):
+            warc_headers["WARC-SiteBench-Failed"] = str(resp_msg["failed"])[:200]
+        if resp_msg.get("encodedDataLength") is not None:
+            warc_headers["WARC-SiteBench-Encoded-Length"] = str(resp_msg["encodedDataLength"])
         record = self.warc_writer.create_warc_record(
             url, "response", payload=io.BytesIO(body_content), http_headers=status_headers,
             warc_headers_dict=warc_headers)
@@ -789,6 +984,13 @@ class ExtensionHost:
             raise
         self._committed = self.warc_file.tell()
         self._write_committed()
+
+
+def _req_key(msg: dict) -> str:
+    """Request identity across the extension's targets: CDP request ids are
+    only unique per target, and child targets (iframes, workers) have their
+    own sessions."""
+    return f"{msg.get('tabId')}|{msg.get('sessionId') or ''}|{msg.get('requestId')}"
 
 
 def _read_int(p: Path) -> int:
@@ -924,7 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
             (session_dir / ".host_done").unlink()
         except FileNotFoundError:
             pass
-        ExtensionHost(session_dir, channel).run()
+        ExtensionHost(session_dir, channel, app_dir=app_dir).run()
     finally:
         lock.release()
     return 0

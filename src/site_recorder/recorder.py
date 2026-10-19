@@ -30,7 +30,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, browsers, nativehost, paths
+from . import __version__, browsers, config, nativehost, paths
 from .config import Config
 from .fsutil import FileLock, atomic_write_json, read_json
 from .sessions import dir_size, screenshot_times
@@ -352,6 +352,8 @@ class Recorder:
                 "browser": b,
                 "profile_dir": str(paths.profile_dir(b)),
                 "started_at": time.time(),
+                # Read by the host and handed to the extension in the handshake.
+                "skip_domains": config.skip_domain_list(self.cfg.skip_domains),
             }
             _write_marker(marker)
         # From here on, ANY failure or interrupt (Ctrl+C during the connect

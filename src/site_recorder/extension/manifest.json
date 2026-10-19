@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SITE Collector",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "description": "SITE-Bench recorder: captures network traffic, screenshots, DOM snapshots, and interactions while a SITE Recorder session is active.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAomACb+Y2lTOLYiJI5VtJqvpwT0wkLLRI5yAKa/t1dv5NE1FB7QuT8geBoDGGTXnGQmxWjSMHf7BY801wtSIVrVz3Hv5GEpZv+5M+sjqS/rtjjBOQP/PQqSjCXHbTym66nrSWoD4H692DtKxSSZoB8m6690A0SCD5SmLAzg1NVquV0nfqm9YhQQJb4Hjdc5Rh47JJWnX5jVez/4ERCDqCWooSDP7f7RaaNxlVjgO7fHxmIKaHNuvb6dnokwl15/1841PtoFC+A+DUWr5vkas7O/+PnGHJKV+wzxuyqGauso10yTc3n08VsxFyRu+lVUfafpKikKUkoZMyA0GzA6KqjwIDAQAB",
   "icons": {

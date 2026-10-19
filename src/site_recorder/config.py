@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -16,6 +17,10 @@ class Config:
     browser: str = ""            # "chrome" | "edge"; "" = not chosen yet
     sessions_dir: str = ""       # "" = default (~/SiteRecorder/sessions)
     start_url: str = ""          # page opened when a recording starts ("" = new tab)
+    # Extra sites never recorded (no screenshots, DOM, events or network), on
+    # top of the password-manager vaults the extension always skips.
+    # Comma/space separated host names; subdomains are included.
+    skip_domains: str = ""
 
     # -- derived -------------------------------------------------------------
     @property
@@ -25,6 +30,17 @@ class Config:
     @property
     def is_configured(self) -> bool:
         return self.browser in BROWSERS
+
+
+def skip_domain_list(raw: str) -> list[str]:
+    """``skip_domains`` as a clean list of host names."""
+    out = []
+    for d in re.split(r"[,\s]+", raw or ""):
+        d = d.strip().lower()
+        d = re.sub(r"^[a-z]+://", "", d).split("/", 1)[0].lstrip("*.")
+        if d and d not in out:
+            out.append(d)
+    return out
 
 
 def load() -> Config:

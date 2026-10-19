@@ -1,9 +1,11 @@
 // src/extension/background.js
 
+import { SecretStore, redactSecrets, scrubLayoutSnapshot } from "./redact.js";
+
 // Build stamp — bump on every change. Surfaced via get_status (popup shows it)
 // and the boot debug log, so we can tell at a glance whether Chrome is running
 // THIS code or a stale cached service worker.
-const SW_BUILD = "2026-10-13b-stop-ack";
+const SW_BUILD = "2026-10-19a-capture-upgrades";
 
 // CRITICAL: take over immediately when a new worker version loads. Extension
 // service workers have install→waiting→active phases just like web SWs; without
@@ -37,6 +39,49 @@ let currentSessionId = null; // session named by the host's "connected" message
 const MAX_BASE64_CHARS = 56 * 1024 * 1024;
 const MAX_TEXT_BYTES = 48 * 1024 * 1024;
 const tabUrls = {}; // Track root URLs for deterministic grouping
+
+// --- Privacy ------------------------------------------------------------------
+// Sites never recorded at all (no screenshots, DOM, events or network): the
+// web vaults of password managers by default; the recorder adds the
+// participant's own list (config "skip_domains") in the handshake.
+const DEFAULT_SKIP_DOMAINS = ["1password.com", "bitwarden.com", "lastpass.com",
+  "keepersecurity.com", "dashlane.com", "nordpass.com"];
+let skipDomains = DEFAULT_SKIP_DOMAINS.slice();
+const skipNoticeSent = new Set();   // "tabId|host" already reported this session
+
+function hostOf(url) {
+  try { return new URL(url).hostname.toLowerCase(); } catch (e) { return ""; }
+}
+
+function isSkippedUrl(url) {
+  const h = hostOf(url);
+  if (!h) return false;
+  return skipDomains.some((d) => h === d || h.endsWith("." + d));
+}
+
+// What the participant typed into sensitive fields, in memory only (never
+// sent to the host): scrubbed out of request bodies, URLs, sent WebSocket
+// frames and layout snapshots. See redact.js.
+const secrets = new SecretStore();
+
+// Per tab, per frame: where that frame's sensitive fields are on screen (top
+// viewport CSS px). Every screenshot of the tab blanks all of them.
+const sensitiveRects = new Map();   // tabId -> Map(frameId -> {rects, unlocated})
+
+function rectsForShot(tabId, frameId, request) {
+  const rects = [];
+  let unlocated = !!request.sensitive_unlocated;
+  const perFrame = sensitiveRects.get(tabId);
+  if (perFrame) {
+    for (const [fid, st] of perFrame) {
+      if (fid === frameId) continue;          // the sender's own boxes come fresh with the event
+      rects.push(...(st.rects || []));
+      if (st.unlocated) unlocated = true;
+    }
+  }
+  if (Array.isArray(request.sensitive_rects)) rects.push(...request.sensitive_rects);
+  return { rects, unlocated };
+}
 
 // Toolbar icon sets, swapped to reflect recording/pause state (updateActionIcon).
 const ACTIVE_ICONS = { 16: "icon_16.png", 32: "icon_32.png", 48: "icon_48.png", 128: "icon_128.png" };
@@ -102,6 +147,8 @@ function connectToNativeHost() {
       // does the cleanup explicitly.)
       const p = port;
       if (isRecording) {
+        // Responses still waiting for loadingFinished go out headers-only.
+        flushPendingResponses("session_end");
         stopCapture("host requested stop");          // a real end of session
       } else {
         detachAll();   // a refused connection (no "connected" yet): keep any pause state
@@ -119,7 +166,12 @@ function connectToNativeHost() {
       const sid = msg.session_id || null;
       const sameSession = !!sid && sid === currentSessionId;
       currentSessionId = sid;
+      if (Array.isArray(msg.skip_domains)) {
+        skipDomains = DEFAULT_SKIP_DOMAINS.concat(
+          msg.skip_domains.map((d) => String(d).trim().toLowerCase().replace(/^\*?\./, "")).filter(Boolean));
+      }
       if (!sameSession) {
+        skipNoticeSent.clear();
         // New session: re-arm debugger attaching even if the user dismissed
         // the banner last session (one banner per session; dismissing sticks).
         debuggerCanceledByUser = false;
@@ -204,6 +256,7 @@ function teardownSession(reason) {
   isRecording = false;
   updateActionIcon();
   pdfTabs.clear(); ensurePdfPoll();   // stop the PDF scroll poller
+  pendingResponses.clear();
   chrome.runtime.sendMessage({ type: "recording_stopped" }).catch(() => {});
   // Detach debuggers from all tabs so the security infobar disappears during
   // the user's normal, everyday browsing.
@@ -356,9 +409,42 @@ function attachDebuggerIfValid(tab) {
       // Expected if already attached
       return;
     }
-    chrome.debugger.sendCommand({ tabId: tab.id }, "Network.enable");
-    chrome.debugger.sendCommand({ tabId: tab.id }, "Network.setCacheDisabled", { cacheDisabled: true });
+    enableNetwork({ tabId: tab.id });
+    // Cross-origin iframes (Stripe, YouTube embeds, OAuth popups-in-frames)
+    // and workers are SEPARATE targets: the tab's own Network domain never
+    // sees their traffic. Auto-attach to them (flattened sessions) and enable
+    // Network on each — see Target.attachedToTarget in the event router.
+    autoAttach({ tabId: tab.id });
   });
+}
+
+function cdp(target, method, params, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(method + " timed out")), timeoutMs);
+    chrome.debugger.sendCommand(target, method, params || {}, (res) => {
+      clearTimeout(timer);
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(res);
+    });
+  });
+}
+
+function enableNetwork(target) {
+  // Bodies are fetched at loadingFinished, so the inspector must still hold
+  // them then: raise the buffers (defaults evict big responses) up to what
+  // one native message can carry. Request bodies up to 1 MB arrive inline;
+  // bigger ones are fetched with getRequestPostData.
+  cdp(target, "Network.enable", {
+    maxTotalBufferSize: 200 * 1024 * 1024,
+    maxResourceBufferSize: 48 * 1024 * 1024,
+    maxPostDataSize: 1024 * 1024,
+  }).catch(() => {});
+  cdp(target, "Network.setCacheDisabled", { cacheDisabled: true }).catch(() => {});
+}
+
+function autoAttach(target) {
+  cdp(target, "Target.setAutoAttach",
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
 }
 
 // Programmatic injection for tabs opened BEFORE the session/extension load —
@@ -408,6 +494,15 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete tabUrls[tabId];
   markPdfTab(tabId, false);
+  sensitiveRects.delete(tabId);
+  lastLayoutAt.delete(tabId);
+});
+
+// Page zoom changes what a CSS pixel is in the screenshots.
+chrome.tabs.onZoomChange.addListener((info) => {
+  if (!capturing()) return;
+  sendToPython({ type: "zoom_change", tabId: info.tabId, zoom: info.newZoomFactor,
+                 old_zoom: info.oldZoomFactor, timestamp: Date.now() / 1000.0 });
 });
 
 // ===== PDF scroll capture (CDP screenshot diff) =====
@@ -489,12 +584,17 @@ function emitTabActivated(tabId) {
     if (chrome.runtime.lastError || !tab) return;
     if (isDashboardUrl(tab.url)) return;
     const ts = Date.now() / 1000.0;
+    // A skipped (privacy) site is reported by origin only, without its title.
+    const skipped = isSkippedUrl(tab.url);
+    let url = tab.url || "";
+    if (skipped) { try { url = new URL(url).origin + "/"; } catch (e) { url = ""; } }
     sendToPython({
       type: "tab_activated",
       tabId,
       windowId: tab.windowId,
-      url: tab.url || "",
-      title: tab.title || "",
+      url,
+      title: skipped ? "" : (tab.title || ""),
+      privacy_skip: skipped || undefined,
       timestamp: ts
     });
     // file:// tabs can't be debugger-attached and emit no WARC traffic,
@@ -561,8 +661,25 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
 // in sync for site_url tagging on the very first request).
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId === 0) ensureConnected();
+  // A navigated frame's old sensitive boxes are gone (a main-frame
+  // navigation replaces every frame).
+  const perFrame = sensitiveRects.get(details.tabId);
+  if (perFrame) {
+    if (details.frameId === 0) sensitiveRects.delete(details.tabId);
+    else perFrame.delete(details.frameId);
+  }
   if (details.frameId !== 0) return;
   if (isDashboardUrl(details.url)) return;
+  if (isSkippedUrl(details.url) && capturing()) {
+    // Say THAT a skipped site was visited (host only), so the gap in the
+    // recording is explained.
+    const h = hostOf(details.url);
+    const k = details.tabId + "|" + h;
+    if (!skipNoticeSent.has(k)) {
+      skipNoticeSent.add(k);
+      sendToPython({ type: "privacy_skip", host: h, tabId: details.tabId, timestamp: Date.now() / 1000.0 });
+    }
+  }
   chrome.tabs.get(details.tabId, (tab) => {
     if (chrome.runtime.lastError || !tab || !tab.active) return;
     emitTabActivated(details.tabId);
@@ -628,148 +745,350 @@ async function fetchAsBase64Pdf(url) {
   }
 }
 
-// Route debugger events to Python
-// Document/html responses whose body was unavailable at responseReceived —
-// fast redirect chains deliver the body only by loadingFinished (and lose it
-// forever once the next document replaces the frame). Retried there.
-const pendingDocBodies = new Map();
+// Route debugger events to Python.
+//
+// Network records are built in two steps. requestWillBeSent goes out at once
+// (with its body, redacted); the response is HELD from responseReceived until
+// loadingFinished — the one moment its body is complete and still buffered —
+// so large and streamed responses (chat apps, big JSON) are no longer
+// captured empty or truncated. The host pairs request + response by key and
+// writes them adjacently to the WARC.
+//
+// Events from auto-attached child targets (cross-origin iframes, workers)
+// arrive with source.sessionId; every follow-up command goes to `source`, so
+// it reaches the target that owns the request.
+const pendingResponses = new Map();   // reqKey -> { payload, source, at }
+const RESPONSE_HOLD_MS = 60000;       // longer = a stream that never finishes
+const MAX_POST_CHARS = 8 * 1024 * 1024;
 
-chrome.debugger.onEvent.addListener(async (source, method, params) => {
+// Per-request promise chains: the CDP round trips for one request (post data,
+// body) run in order, so the host always sees request -> response for it.
+const requestChains = new Map();
+function chainFor(key, fn) {
+  const prev = requestChains.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn).catch((e) => debugLog("network handler: " + (e && e.message)));
+  requestChains.set(key, next);
+  next.then(() => { if (requestChains.get(key) === next) requestChains.delete(key); });
+  return next;
+}
+
+function reqKey(source, requestId) {
+  return source.tabId + "|" + (source.sessionId || "") + "|" + requestId;
+}
+
+function flushPendingResponses(reason) {
+  for (const [key, p] of pendingResponses) {
+    pendingResponses.delete(key);
+    p.payload.bodyOmitted = reason;
+    sendToPython(p.payload);
+  }
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - RESPONSE_HOLD_MS;
+  for (const [key, p] of pendingResponses) {
+    if (p.at < cutoff) {
+      pendingResponses.delete(key);
+      p.payload.bodyOmitted = "unfinished";   // e.g. an SSE / long-poll stream
+      sendToPython(p.payload);
+    }
+  }
+}, 15000);
+
+// Where a request came from: parser, script (top of the JS stack), preload…
+// Lets downstream tie a request to the user action that caused it.
+function trimInitiator(init) {
+  if (!init || typeof init !== "object") return undefined;
+  const out = { type: init.type };
+  if (init.url) out.url = String(init.url).slice(0, 500);
+  if (typeof init.lineNumber === "number") out.lineNumber = init.lineNumber;
+  if (init.requestId) out.requestId = init.requestId;
+  const frames = init.stack && init.stack.callFrames;
+  if (Array.isArray(frames) && frames.length) {
+    out.stack = frames.slice(0, 3).map((f) => ({
+      url: String(f.url || "").slice(0, 300), fn: f.functionName || "", line: f.lineNumber,
+    }));
+  }
+  return out;
+}
+
+function slimResponse(r) {
+  if (!r) return undefined;
+  return { url: r.url, status: r.status, statusText: r.statusText, headers: r.headers,
+           mimeType: r.mimeType, protocol: r.protocol };
+}
+
+// postDataEntries (base64 chunks) -> text when it is UTF-8, else base64.
+function decodePostEntries(entries) {
+  try {
+    const parts = entries.map((e) => (e && e.bytes) ? Uint8Array.from(atob(e.bytes), (c) => c.charCodeAt(0)) : new Uint8Array(0));
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const all = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { all.set(p, o); o += p.length; }
+    try {
+      return { text: new TextDecoder("utf-8", { fatal: true }).decode(all) };
+    } catch (e) {
+      return { base64: arrayBufferToBase64(all.buffer) };
+    }
+  } catch (e) {
+    return null;
+  }
+}
+
+async function handleRequestWillBeSent(source, params, siteUrl) {
+  const request = Object.assign({}, params.request);
+  let postText = null, postBase64 = null;
+  if (Array.isArray(request.postDataEntries) && request.postDataEntries.length) {
+    const dec = decodePostEntries(request.postDataEntries);
+    if (dec) { postText = dec.text != null ? dec.text : null; postBase64 = dec.base64 || null; }
+  }
+  if (postText == null && postBase64 == null && typeof request.postData === "string") postText = request.postData;
+  if (postText == null && postBase64 == null && request.hasPostData) {
+    try {
+      const r = await cdp(source, "Network.getRequestPostData", { requestId: params.requestId }, 5000);
+      if (r && typeof r.postData === "string") postText = r.postData;
+    } catch (e) { /* body no longer available (or a streamed upload) */ }
+  }
+  delete request.postDataEntries;
+  delete request.postData;
+  const sec = secrets.values();
+  request.url = redactSecrets(request.url, sec);
+  const msg = {
+    type: "network_request",
+    requestId: params.requestId,
+    request,
+    timestamp: params.timestamp,
+    wallTime: params.wallTime,
+    typeStr: params.type,
+    tabId: source.tabId,
+    sessionId: source.sessionId,
+    frameId: params.frameId,
+    loaderId: params.loaderId,
+    documentURL: params.documentURL,
+    initiator: trimInitiator(params.initiator),
+    site_url: siteUrl,
+  };
+  if (postText != null) {
+    if (postText.length > MAX_POST_CHARS) msg.postDataOmitted = "too_large";
+    else msg.postData = redactSecrets(postText, sec);
+  } else if (postBase64 != null) {
+    // Binary (multipart file upload, protobuf): kept as bytes, not scrubbable.
+    if (postBase64.length > MAX_POST_CHARS) msg.postDataOmitted = "too_large";
+    else msg.postDataBase64 = postBase64;
+  }
+  if (params.redirectResponse) {
+    // Same requestId, next hop: the host writes the previous hop's request
+    // with this 3xx as its response (redirect chains used to vanish).
+    msg.redirectResponse = slimResponse(params.redirectResponse);
+  }
+  sendToPython(msg);
+}
+
+async function fillResponseBody(p) {
+  const payload = p.payload;
+  try {
+    const bodyResult = await cdp(p.source, "Network.getResponseBody", { requestId: payload.requestId });
+    payload.body = bodyResult.body;
+    payload.base64Encoded = bodyResult.base64Encoded;
+  } catch (e) {
+    // Expected for empty bodies, 204s, preflights, main-frame documents
+    // (those come from the content script's DOM snapshot instead).
+  }
+
+  // PDF body fallback. Chrome's built-in PDF viewer pipeline pulls the
+  // bytes out of band from CDP, so `Network.getResponseBody` either
+  // returns an empty body or a bot-check HTML interstitial instead of
+  // the PDF. Detect those cases by content-type, then re-fetch the URL
+  // from the service worker (which has cross-origin + cookies via
+  // host_permissions) and substitute the real bytes.
+  const respUrl = payload.response && payload.response.url;
+  const ctHeader = pickHeader(payload.response && payload.response.headers, "content-type") || "";
+  const isPdfResponse = /application\/pdf/i.test(ctHeader) || /\.pdf(\?|$|#)/i.test(respUrl || "");
+  if (isPdfResponse && respUrl && /^https?:/i.test(respUrl)) {
+    const cdpBody = decodeBodyForCheck(payload.body, payload.base64Encoded);
+    if (!(cdpBody && cdpBody.startsWith("%PDF"))) {
+      const refetched = await fetchAsBase64Pdf(respUrl);
+      if (refetched) {
+        payload.body = refetched;
+        payload.base64Encoded = true;
+        payload.bodySource = "sw_fetch";
+      }
+    }
+  }
+  if (bodyTooLarge(payload.body, payload.base64Encoded)) {
+    delete payload.body;
+    delete payload.base64Encoded;
+    payload.bodyOmitted = "too_large";
+  }
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  // Child targets: enable network capture on every auto-attached iframe /
+  // worker (and auto-attach below nested iframes). Setup, not capture — it
+  // runs even while paused so a resume finds them ready.
+  if (method === "Target.attachedToTarget") {
+    const child = { tabId: source.tabId, sessionId: params.sessionId };
+    const t = params.targetInfo && params.targetInfo.type;
+    if (t === "iframe" || t === "worker" || t === "shared_worker") {
+      enableNetwork(child);
+      if (t === "iframe") autoAttach(child);
+    }
+    if (params.waitingForDebugger) cdp(child, "Runtime.runIfWaitingForDebugger").catch(() => {});
+    return;
+  }
+
   let siteUrl = tabUrls[source.tabId] || "";
+  const key = params && params.requestId ? reqKey(source, params.requestId) : "";
 
   // Belt-and-suspenders: we never attach the debugger to the dashboard tab,
   // but if a request URL or tab URL belongs to the dashboard we drop it
   // anyway so nothing about the recorder ever lands in the WARC.
-  if (isDashboardUrl(siteUrl)) return;
   const reqUrl = params && params.request && params.request.url;
   const respUrl = params && params.response && params.response.url;
-  if (isDashboardUrl(reqUrl) || isDashboardUrl(respUrl)) return;
-
   // Capture eligibility is decided when the event ARRIVES: work started
-  // during a pause (a body retry, a PDF refetch) must not be written after
+  // during a pause (a body fetch, a PDF refetch) must not be written after
   // the participant resumes.
-  if (!capturing()) {
-    if (method === "Network.loadingFinished") pendingDocBodies.delete(params.requestId);
+  if (isDashboardUrl(siteUrl) || isDashboardUrl(reqUrl) || isDashboardUrl(respUrl)
+      || isSkippedUrl(siteUrl) || !capturing()) {
+    if (key) pendingResponses.delete(key);
     return;
   }
-  if (method === "Network.requestWillBeSent") {
-    sendToPython({
-      type: "network_request",
-      requestId: params.requestId,
-      request: params.request,
-      timestamp: params.timestamp,
-      typeStr: params.type,
-      tabId: source.tabId,
-      frameId: params.frameId,
-      loaderId: params.loaderId,
-      site_url: siteUrl
-    });
-  } else if (method === "Network.responseReceived") {
-    const responsePayload = {
-      type: "network_response",
-      requestId: params.requestId,
-      response: params.response,
-      timestamp: params.timestamp,
-      typeStr: params.type,
-      tabId: source.tabId,
-      frameId: params.frameId,
-      loaderId: params.loaderId,
-      site_url: siteUrl
-    };
 
+  if (method === "Network.requestWillBeSent") {
+    chainFor(key, () => handleRequestWillBeSent(source, params, siteUrl));
+  } else if (method === "Network.responseReceived") {
     // Track PDF documents so the scroll poller can capture reading — content
     // scripts can't run in Chrome's PDF viewer. A Document response with an
     // application/pdf mime marks the tab; any other Document navigation clears it.
-    if (params.type === "Document") {
+    if (params.type === "Document" && !source.sessionId) {
       const mt = ((params.response && params.response.mimeType) || "").toLowerCase();
       markPdfTab(source.tabId, mt.indexOf("application/pdf") !== -1);
     }
-
-    // Attempt to get the body via CDP first.
-    try {
-      const bodyResult = await new Promise((resolve, reject) => {
-        chrome.debugger.sendCommand(source, "Network.getResponseBody", { requestId: params.requestId }, (result) => {
-           if (chrome.runtime.lastError) {
-               reject(chrome.runtime.lastError);
-           } else {
-               resolve(result);
-           }
-        });
+    chainFor(key, () => {
+      pendingResponses.set(key, {
+        source, at: Date.now(),
+        payload: {
+          type: "network_response",
+          requestId: params.requestId,
+          response: params.response,
+          timestamp: params.timestamp,
+          typeStr: params.type,
+          tabId: source.tabId,
+          sessionId: source.sessionId,
+          frameId: params.frameId,
+          loaderId: params.loaderId,
+          site_url: siteUrl,
+        },
       });
-      responsePayload.body = bodyResult.body;
-      responsePayload.base64Encoded = bodyResult.base64Encoded;
-    } catch (e) {
-      // Suppress expected errors (e.g. empty bodies, 204s, preflights, websockets)
-      // console.log(`Could not get body for ${params.requestId}:`, e.message);
-    }
-
-    // PDF body fallback. Chrome's built-in PDF viewer pipeline pulls the
-    // bytes out of band from CDP, so `Network.getResponseBody` either
-    // returns an empty body or a bot-check HTML interstitial instead of
-    // the PDF. Detect those cases by content-type, then re-fetch the URL
-    // from the service worker (which has cross-origin + cookies via
-    // host_permissions) and substitute the real bytes.
-    const ctHeader = pickHeader(params.response && params.response.headers, "content-type") || "";
-    const isPdfResponse =
-      /application\/pdf/i.test(ctHeader)
-      || /\.pdf(\?|$|#)/i.test(respUrl || "");
-    if (isPdfResponse && respUrl && /^https?:/i.test(respUrl)) {
-      const cdpBody = decodeBodyForCheck(responsePayload.body, responsePayload.base64Encoded);
-      const cdpLooksLikePdf = cdpBody && cdpBody.startsWith("%PDF");
-      if (!cdpLooksLikePdf) {
-        const refetched = await fetchAsBase64Pdf(respUrl);
-        if (refetched) {
-          responsePayload.body = refetched;
-          responsePayload.base64Encoded = true;
-          responsePayload.bodySource = "sw_fetch";
-        }
-      }
-    }
-    if (bodyTooLarge(responsePayload.body, responsePayload.base64Encoded)) {
-      delete responsePayload.body;
-      delete responsePayload.base64Encoded;
-      responsePayload.bodyOmitted = "too_large";
-    }
-    // HTML BODY CAPTURE RACE (E7b): for document/html responses the body is
-    // often NOT retrievable yet at responseReceived (loading unfinished) or
-    // already gone (frame navigated). Remember the payload and retry at
-    // Network.loadingFinished — the one moment the body is complete AND still
-    // buffered. The re-sent record supersedes the empty one downstream.
-    const isHtmlDoc = params.type === "Document"
-      || /text\/html/i.test(pickHeader(params.response && params.response.headers, "content-type") || "");
-    if (isHtmlDoc && !responsePayload.body) {
-      if (pendingDocBodies.size > 800) pendingDocBodies.clear();
-      pendingDocBodies.set(params.requestId, responsePayload);
-    }
-    sendToPython(responsePayload);
+    });
   } else if (method === "Network.loadingFinished") {
-    const pend = pendingDocBodies.get(params.requestId);
-    if (pend) {
-      pendingDocBodies.delete(params.requestId);
-      chrome.debugger.sendCommand(source, "Network.getResponseBody", { requestId: params.requestId }, (result) => {
-        if (!chrome.runtime.lastError && result && result.body && capturing()
-            && !bodyTooLarge(result.body, result.base64Encoded)) {
-          pend.body = result.body;
-          pend.base64Encoded = result.base64Encoded;
-          pend.bodyRetry = true;
-          sendToPython(pend);
-        }
+    chainFor(key, async () => {
+      const p = pendingResponses.get(key);
+      if (!p) return;
+      pendingResponses.delete(key);
+      p.payload.encodedDataLength = params.encodedDataLength;
+      p.payload.finishedTimestamp = params.timestamp;
+      await fillResponseBody(p);
+      if (capturing()) sendToPython(p.payload);
+    });
+  } else if (method === "Network.loadingFailed") {
+    chainFor(key, () => {
+      const p = pendingResponses.get(key);
+      if (p) {
+        pendingResponses.delete(key);
+        p.payload.failed = params.errorText || "failed";
+        sendToPython(p.payload);
+      }
+      sendToPython({
+        type: "network_failed", requestId: params.requestId, tabId: source.tabId,
+        sessionId: source.sessionId, timestamp: params.timestamp, typeStr: params.type,
+        errorText: params.errorText, canceled: !!params.canceled,
+        blockedReason: params.blockedReason, site_url: siteUrl,
       });
-    }
-  } else if (method === "Network.webSocketFrameReceived") {
+    });
+  } else if (method === "Network.webSocketCreated") {
+    sendToPython({ type: "websocket_event", event: "created", requestId: params.requestId,
+                   url: redactSecrets(params.url, secrets.values()),
+                   initiator: trimInitiator(params.initiator),
+                   timestamp: Date.now() / 1000.0, tabId: source.tabId, site_url: siteUrl });
+  } else if (method === "Network.webSocketHandshakeResponseReceived") {
+    sendToPython({ type: "websocket_event", event: "handshake", requestId: params.requestId,
+                   timestamp: params.timestamp, status: params.response && params.response.status,
+                   headers: params.response && params.response.headers,
+                   tabId: source.tabId, site_url: siteUrl });
+  } else if (method === "Network.webSocketFrameReceived" || method === "Network.webSocketFrameSent") {
+    const sent = method === "Network.webSocketFrameSent";
+    let payloadData = params.response && params.response.payloadData;
+    // What the CLIENT sends may carry a typed secret (a login over a socket).
+    if (sent) payloadData = redactSecrets(payloadData, secrets.values());
     sendToPython({
       type: "websocket_frame",
+      direction: sent ? "sent" : "received",
       requestId: params.requestId,
       timestamp: params.timestamp,
-      response: {
-        opcode: params.response.opcode,
-        payloadData: params.response.payloadData
-      },
+      response: { opcode: params.response && params.response.opcode, payloadData },
       tabId: source.tabId,
       site_url: siteUrl
     });
+  } else if (method === "Network.webSocketClosed") {
+    sendToPython({ type: "websocket_event", event: "closed", requestId: params.requestId,
+                   timestamp: params.timestamp, tabId: source.tabId, site_url: siteUrl });
+  } else if (method === "Network.eventSourceMessageReceived") {
+    // Server-sent events (live feeds, LLM token streams): the response body
+    // of an SSE request never "finishes", so the messages are the content.
+    sendToPython({ type: "eventsource_message", requestId: params.requestId,
+                   timestamp: params.timestamp, eventName: params.eventName,
+                   eventId: params.eventId, data: params.data,
+                   tabId: source.tabId, site_url: siteUrl });
   }
 });
+
+// --- Layout snapshots ---------------------------------------------------------
+// DOMSnapshot.captureSnapshot: the whole DOM (iframes + shadow DOM included)
+// with every node's layout box, text boxes, paint order and a whitelist of
+// computed styles — pixel-level ground truth to pair with the screenshots.
+// Taken alongside the content script's load/mutation DOM snapshots, at most
+// once per LAYOUT_MIN_GAP_MS per tab, gzip-compressed for the native port.
+const LAYOUT_STYLES = ["display", "visibility", "opacity", "position", "z-index", "overflow",
+  "color", "background-color", "background-image", "border-top-color", "border-top-width",
+  "border-radius", "box-shadow", "font-family", "font-size", "font-weight", "font-style",
+  "line-height", "text-align", "text-decoration-line", "text-transform", "letter-spacing",
+  "cursor", "transform"];
+const LAYOUT_MIN_GAP_MS = 10000;
+const lastLayoutAt = new Map();
+
+async function gzipBase64(text) {
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
+  return arrayBufferToBase64(await new Response(stream).arrayBuffer());
+}
+
+async function captureLayoutSnapshot(tab, url) {
+  if (!tab || tab.id == null || !capturing() || debuggerCanceledByUser) return;
+  const now = Date.now();
+  if (now - (lastLayoutAt.get(tab.id) || 0) < LAYOUT_MIN_GAP_MS) return;
+  lastLayoutAt.set(tab.id, now);
+  const target = { tabId: tab.id };
+  try {
+    await cdp(target, "DOMSnapshot.enable").catch(() => {});
+    const snap = await cdp(target, "DOMSnapshot.captureSnapshot", {
+      computedStyles: LAYOUT_STYLES, includeDOMRects: true, includePaintOrder: true,
+    }, 20000);
+    cdp(target, "DOMSnapshot.disable").catch(() => {});
+    if (!capturing()) return;
+    scrubLayoutSnapshot(snap, secrets.values());
+    const json = JSON.stringify(snap);
+    const gz = await gzipBase64(json);
+    if (gz.length > MAX_BASE64_CHARS) {
+      debugLog("layout snapshot skipped: too large (" + gz.length + " b64 chars)");
+      return;
+    }
+    sendToPython({ type: "layout_snapshot", timestamp: now / 1000.0, url, tabId: tab.id,
+                   bytes: json.length, styles: LAYOUT_STYLES, data_gz_b64: gz });
+  } catch (e) {
+    debugLog("layout snapshot failed: " + (e && e.message));
+  }
+}
 
 // 2. Intercept Downloads
 //
@@ -859,6 +1178,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'secret_value') {
+    // Typed into a sensitive field: remembered in memory ONLY, for scrubbing.
+    // Kept even while paused (nothing is captured then anyway).
+    const tabId = sender.tab ? sender.tab.id : "x";
+    secrets.set(tabId + ":" + sender.frameId + ":" + request.key, request.value);
+    return;
+  }
+
+  if (request.action === 'sensitive_rects') {
+    if (!sender.tab) return;
+    let perFrame = sensitiveRects.get(sender.tab.id);
+    if (!perFrame) { perFrame = new Map(); sensitiveRects.set(sender.tab.id, perFrame); }
+    if ((request.rects && request.rects.length) || request.unlocated) {
+      perFrame.set(sender.frameId, { rects: request.rects || [], unlocated: !!request.unlocated });
+    } else {
+      perFrame.delete(sender.frameId);
+    }
+    return;
+  }
+
   if (request.action === 'record_event') {
     if (isPaused) {
       return; // Recording paused for privacy — capture nothing.
@@ -868,7 +1207,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     // Never record interactions / screenshots from the recorder dashboard.
     const tabUrl = sender.tab ? sender.tab.url : null;
-    if (isDashboardUrl(tabUrl)) {
+    if (isDashboardUrl(tabUrl) || isSkippedUrl(tabUrl)) {
       return;
     }
 
@@ -877,16 +1216,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     // Use an IIFE so we don't block the message listener with async (which can cause issues)
     (async () => {
-        const base64Image = await captureScreenshotPNG(tabId, windowId);
-
-        sendToPython({
+        const msg = {
           type: "browser_snapshot",
           timestamp: Date.now() / 1000.0,
           event_type: request.type,
           details: request.details,
-          image_data: base64Image,
-          url: sender.tab ? sender.tab.url : null
-        });
+          url: tabUrl,
+          frameId: sender.frameId,
+        };
+        if (sender.frameId) msg.frame_url = sender.url;
+        if (request.shot === false) {
+          // Recorded, but inside the screenshot cooldown: event only.
+          msg.screenshot = false;
+        } else {
+          const { rects, unlocated } = rectsForShot(tabId, sender.frameId, request);
+          msg.image_data = await captureScreenshotPNG(tabId, windowId);
+          // The host blanks these boxes (top-viewport CSS px; x devicePixelRatio
+          // = image px) before the PNG touches disk; "unlocated" = a sensitive
+          // field whose position is unknown, so the image is not kept at all.
+          if (rects.length) msg.redact_rects = rects;
+          if (unlocated) msg.redact_unlocated = true;
+        }
+        sendToPython(msg);
     })();
     return true; // Keep message channel open if needed
   }
@@ -903,14 +1254,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (sender.tab && !sender.tab.active) return;
     const tabUrl = sender.tab ? sender.tab.url : null;
     if (isDashboardUrl(tabUrl) || isDashboardUrl(request.url)) return;
+    if (isSkippedUrl(tabUrl) || isSkippedUrl(request.url)) return;
     sendToPython({
       type: "dom_snapshot",
       timestamp: request.ts || (Date.now() / 1000.0),
       url: request.url || tabUrl,
       title: request.title || "",
       reason: request.reason || "",
-      html: request.html || ""
+      html: redactSecrets(request.html || "", secrets.values()),
+      shadow_roots: request.shadow_roots,
+      cssom_bytes: request.cssom_bytes,
+      env: request.env
     });
+    if (request.reason === "load" || request.reason === "mutation") {
+      captureLayoutSnapshot(sender.tab, request.url || tabUrl);
+    }
     return;
   }
 
@@ -920,7 +1278,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (isPaused) return;
     if (sender.tab && !sender.tab.active) return;
     const tabUrl = sender.tab ? sender.tab.url : null;
-    if (isDashboardUrl(tabUrl)) return;
+    if (isDashboardUrl(tabUrl) || isSkippedUrl(tabUrl)) return;
     sendToPython({
       type: "file_upload",
       timestamp: (request.file && request.file.ts) || (Date.now() / 1000.0),
@@ -938,7 +1296,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (isPaused) return;
     if (sender.tab && !sender.tab.active) return;
     const tabUrl = sender.tab ? sender.tab.url : null;
-    if (isDashboardUrl(tabUrl)) return;
+    if (isDashboardUrl(tabUrl) || isSkippedUrl(tabUrl)) return;
     debugLog("file_save_target -> " + (request.name || "(unnamed)"));
     sendToPython({
       type: "download_started",

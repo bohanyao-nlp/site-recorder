@@ -59,9 +59,14 @@ same way and run the installer again. Your existing recordings won't be affected
 4. When you're finished, click **■ Stop** or close the recording browser window. The session saves
    automatically.
 
-**What gets recorded:** screenshots of the recording window, clicks, typed text (but not passwords),
-scrolling, the pages you visit and their network traffic, and any files you upload or download in that
-window.
+**What gets recorded:** screenshots of the recording window, clicks, typed text, scrolling, the pages
+you visit and their network traffic, and any files you upload or download in that window.
+
+**What doesn't:** anything you type into password, card-number or one-time-code fields. Those fields are
+blanked out in screenshots, and what you typed is removed from the network traffic. Login cookies and
+tokens are replaced by meaningless placeholders. Password-manager websites are never recorded. To skip
+other sites, add them to `"skip_domains"` in the app folder's `config.json` (for example
+`"mybank.com, mail.example.org"`).
 
 ## 4. Send me your recordings
 
