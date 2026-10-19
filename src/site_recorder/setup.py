@@ -213,14 +213,9 @@ def _ask(prompt: str, default: str = "") -> str:
     return v or default
 
 
-def interactive_setup(participant: str | None = None, browser: str | None = None,
-                      noninteractive: bool = False) -> int:
+def interactive_setup(browser: str | None = None, noninteractive: bool = False) -> int:
     cfg = config.load()
     print(f"SITE Recorder {__version__} setup\n")
-    pid = participant or cfg.participant_id
-    if not noninteractive:
-        pid = _ask("Participant ID (from the study team)", pid)
-    pid = config.clean_participant_id(pid or "")
     installed = browsers.installed_browsers()
     if not installed:
         print("Neither Google Chrome nor Microsoft Edge was found. Install one of them and re-run setup.")
@@ -231,11 +226,11 @@ def interactive_setup(participant: str | None = None, browser: str | None = None
     if b not in installed:
         print(f"{b!r} is not installed here (found: {', '.join(installed)}).")
         return 1
-    cfg.participant_id, cfg.browser = pid, b
+    cfg.browser = b
     config.save(cfg)
     prepare(b)
     install_shortcuts(quiet=True)
-    print(f"✓ Settings saved (participant {pid or '—'}, {browsers.DISPLAY_NAME[b]})")
+    print(f"✓ Settings saved ({browsers.DISPLAY_NAME[b]})")
     print(f"✓ Native host registered; recordings go to {cfg.sessions_path}")
 
     st = browsers.extension_state(b)
@@ -262,8 +257,6 @@ def interactive_setup(participant: str | None = None, browser: str | None = None
         else:
             print("✗ Did not detect the extension. Re-run `site-recorder setup` to try again.")
             return 1
-    if not pid:
-        print("! No participant ID set — exports need one. Re-run setup to set it.")
     print("\nSetup complete. Start the app with `site-recorder` (or the SITE Recorder shortcut).")
     return 0
 
@@ -494,8 +487,7 @@ def doctor_report() -> str:
                  f"{platform.system()} {platform.release()} ({platform.machine()})")
     lines.append(f"app dir: {paths.app_dir()}")
     lines.append(f"sessions: {cfg.sessions_path}\n")
-    check(bool(cfg.participant_id), f"participant ID: {cfg.participant_id or '(not set)'}", "Setup → step 1")
-    check(cfg.browser in config.BROWSERS, f"browser: {cfg.browser or '(not chosen)'}", "Setup → step 2")
+    check(cfg.browser in config.BROWSERS, f"browser: {cfg.browser or '(not chosen)'}", "Setup → step 1")
     try:
         import warcio  # noqa: F401
         check(True, "warcio importable")
@@ -512,7 +504,7 @@ def doctor_report() -> str:
         check(st["installed"], f"extension in recording profile: "
                                f"{'installed' if st['installed'] else 'missing'}"
                                + (f" (v{st['version'] or '?'}, {st.get('source')})" if st["installed"] else ""),
-              "Setup → step 3")
+              "Setup → step 2")
         if st["installed"]:
             fix = ("Setup → 'Use the bundled copy' switches Developer mode back on"
                    if st.get("problem") == "developer_mode_off"

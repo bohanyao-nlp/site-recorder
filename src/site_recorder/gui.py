@@ -4,7 +4,7 @@ One window, two tabs:
 
 * Record   — big Start / Pause / Stop, live counters, and the list of
              recorded sessions with Export / Delete / Open folder.
-* Setup    — participant ID, browser choice, extension installation
+* Setup    — browser choice, extension installation
              (guided), diagnostics.
 
 All slow work (starting the browser and waiting for the extension, stopping
@@ -153,13 +153,7 @@ class App:
     # -------------------------------------------------------------- setup tab
     def _build_setup_tab(self) -> None:
         t = self.tab_setup
-        ttk.Label(t, text="1. Your participant ID", style="H.TLabel").grid(row=0, column=0, sticky="w")
-        self.pid_var = tk.StringVar(value=self.cfg.participant_id)
-        e = ttk.Entry(t, textvariable=self.pid_var, width=30)
-        e.grid(row=1, column=0, sticky="w", pady=(2, 10))
-        ttk.Label(t, text="(given to you by the study team)", style="Dim.TLabel").grid(row=1, column=1, sticky="w")
-
-        ttk.Label(t, text="2. Browser to record in", style="H.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(t, text="1. Browser to record in", style="H.TLabel").grid(row=2, column=0, sticky="w")
         self.browser_var = tk.StringVar(value=self.cfg.browser or (browsers.installed_browsers() or ["chrome"])[0])
         bf = ttk.Frame(t)
         bf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 4))
@@ -174,7 +168,7 @@ class App:
                   wraplength=680, style="Dim.TLabel").grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
         ttk.Button(t, text="Save", command=self.on_save_settings).grid(row=5, column=0, sticky="w", pady=(0, 12))
 
-        ttk.Label(t, text="3. Install the SITE Collector extension (once)", style="H.TLabel").grid(
+        ttk.Label(t, text="2. Install the SITE Collector extension (once)", style="H.TLabel").grid(
             row=6, column=0, columnspan=2, sticky="w")
         self.ext_status = ttk.Label(t, text="", style="Dim.TLabel")
         self.ext_status.grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 4))
@@ -188,7 +182,7 @@ class App:
         ttk.Button(eb, text="Copy folder path", command=self.on_copy_ext_path).pack(side="left")
         ttk.Button(eb, text="Check again", command=self.refresh_setup).pack(side="left", padx=6)
 
-        ttk.Label(t, text="4. Sign in to the websites you will use (optional)", style="H.TLabel").grid(
+        ttk.Label(t, text="3. Sign in to the websites you will use (optional)", style="H.TLabel").grid(
             row=10, column=0, columnspan=2, sticky="w")
         ttk.Label(t, text="The recording browser starts with no accounts. Open it (not recorded) and sign "
                           "in once to the sites your tasks need; it remembers them.",
@@ -271,8 +265,7 @@ class App:
             self._last_setup_refresh = time.time()
             self.refresh_setup()
         m = recorder.active_session()
-        self.who_lbl.configure(text=f"Participant {self.cfg.participant_id or '—'} · "
-                                    f"{browsers.DISPLAY_NAME.get(self.cfg.browser, '—')}")
+        self.who_lbl.configure(text=f"Browser: {browsers.DISPLAY_NAME.get(self.cfg.browser, '—')}")
         self.footer_lbl.configure(text=f"site-recorder {__version__}"
                                   + (f"   ·   {self.job_label}" if self.job else ""))
         if self.busy:
@@ -371,9 +364,6 @@ class App:
 
     # ---------------------------------------------------------------- actions
     def on_save_settings(self) -> None:
-        pid = config.clean_participant_id(self.pid_var.get())
-        self.pid_var.set(pid)
-        self.cfg.participant_id = pid
         self.cfg.browser = self.browser_var.get()
         config.save(self.cfg)
         try:
@@ -476,10 +466,6 @@ class App:
                                 "Use 'Export new sessions' to create the .zip to send.", parent=self.root)
 
     def _export(self, ids: list[str]) -> None:
-        if not self.cfg.participant_id:
-            messagebox.showwarning("SITE Recorder", "Set your participant ID in Setup first.", parent=self.root)
-            self.nb.select(self.tab_setup)
-            return
         m = recorder.active_session()
         ids = [i for i in ids if not (m and m.get("session_id") == i)]
         if not ids:
@@ -490,8 +476,7 @@ class App:
             outs = []
             for i in ids:
                 self.job_label = f"Exporting {i}…"
-                outs.append(export.export_session(self.cfg.sessions_path / i, paths.exports_dir(),
-                                                  participant_id=self.cfg.participant_id))
+                outs.append(export.export_session(self.cfg.sessions_path / i, paths.exports_dir()))
             return outs
 
         def done(outs):

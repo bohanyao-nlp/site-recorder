@@ -8,7 +8,7 @@ from site_recorder import config, gui, recorder, sessions
 
 SRV = testsite.start(8766)
 cfg = config.load()
-cfg.participant_id, cfg.browser, cfg.start_url = "gui01", sys.argv[1], "http://127.0.0.1:8766/a"
+cfg.browser, cfg.start_url = sys.argv[1], "http://127.0.0.1:8766/a"
 config.save(cfg)
 
 # Dialogs would block an unattended run: record them instead.

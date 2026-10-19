@@ -55,21 +55,17 @@ def test_seed_profile_only_fresh(home):
     assert ls["background_mode"]["enabled"] is False
 
 
-def test_clean_participant_id():
-    assert config.clean_participant_id("  P 07 / a\\b ") == "P-07-a-b"
-    assert config.clean_participant_id("x" * 100) == "x" * 40
-
-
 def test_config_roundtrip_and_corrupt(home):
     cfg = config.load()
-    cfg.participant_id, cfg.browser = "P1", "edge"
+    cfg.browser = "edge"
     config.save(cfg)
     assert config.load().is_configured
     paths.config_file().write_text("{not json")
-    assert config.load().participant_id == ""          # corrupt -> defaults, no crash
-    paths.config_file().write_text(json.dumps({"browser": "safari", "participant_id": 5}))
+    assert not config.load().is_configured             # corrupt -> defaults, no crash
+    # unknown browser -> unset; keys of older versions (participant_id) are ignored
+    paths.config_file().write_text(json.dumps({"browser": "safari", "participant_id": "P1"}))
     c = config.load()
-    assert c.browser == "" and c.participant_id == ""
+    assert c.browser == "" and not hasattr(c, "participant_id")
 
 
 def _session(home: Path, sid="20260101_101010", shots=2, warc=True, host=True) -> Path:
@@ -144,7 +140,7 @@ def test_set_paused_writes_control(home):
     me = psutil.Process(os.getpid())
     recorder._write_marker({"session_dir": str(sd), "session_id": sd.name, "state": "recording",
                             "recorder_pid": me.pid, "recorder_started": me.create_time(), "cmd": 0})
-    r = recorder.Recorder(config.Config(participant_id="p", browser="chrome"))
+    r = recorder.Recorder(config.Config(browser="chrome"))
     r.set_paused(True)
     r.set_paused(True)          # same value again must still be a NEW command
     c = json.loads((sd / "control.json").read_text())
@@ -256,7 +252,7 @@ def test_export_failure_leaves_no_partial(tmp_path, monkeypatch):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(export, "_write_zip", boom)
     with pytest.raises(OSError):
-        export.export_session(sd, tmp_path / "out", participant_id="p")
+        export.export_session(sd, tmp_path / "out")
     assert not list((tmp_path / "out").glob("*"))
 
 

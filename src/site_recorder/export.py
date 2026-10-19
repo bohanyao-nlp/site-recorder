@@ -1,12 +1,12 @@
 """Pack a recorded session into one .zip the participant sends back.
 
-Layout of ``<participant>_<session_id>.zip``::
+Layout of ``<session_id>.zip``::
 
     <session_id>/                      the session folder, as recorded
         archive/session.warc.gz
         browser_screenshots/*.png
         events.jsonl  tab_timeline.jsonl  dom_snapshots/  ...
-        export_manifest.json           written last: who/what/versions +
+        export_manifest.json           written last: versions +
                                        sha256 of every file above
 
 The server-side ingest (server/ingest.py) verifies every checksum
@@ -56,14 +56,14 @@ def _iter_files(session_dir: Path) -> Iterable[Path]:
         yield p
 
 
-def export_zip_name(participant_id: str, session_id: str) -> str:
-    return f"{participant_id or 'anonymous'}_{session_id}.zip"
+def export_zip_name(session_id: str) -> str:
+    return f"{session_id}.zip"
 
 
-def export_session(session_dir: Path, dest_dir: Path, *, participant_id: str,
+def export_session(session_dir: Path, dest_dir: Path, *,
                    extra_info: dict | None = None,
                    progress: Callable[[int, int], None] | None = None) -> Path:
-    """Write the session to ``dest_dir/<participant>_<session>.zip``.
+    """Write the session to ``dest_dir/<session>.zip``.
 
     Written to a ``.partial`` file and renamed at the end, so an interrupted
     export never leaves a plausible-looking but broken zip behind.
@@ -73,12 +73,12 @@ def export_session(session_dir: Path, dest_dir: Path, *, participant_id: str,
     files = list(_iter_files(session_dir))
     total = sum(f.stat().st_size for f in files)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    out = dest_dir / export_zip_name(participant_id, sid)
+    out = dest_dir / export_zip_name(sid)
     tmp = out.with_name(out.name + ".partial")
 
     entries = []
     try:
-        _write_zip(tmp, session_dir, sid, files, total, entries, progress, participant_id, extra_info)
+        _write_zip(tmp, session_dir, sid, files, total, entries, progress, extra_info)
     except BaseException:
         # Never leave a big half-written file behind (e.g. disk full).
         try:
@@ -99,7 +99,7 @@ def export_session(session_dir: Path, dest_dir: Path, *, participant_id: str,
 
 
 def _write_zip(tmp: Path, session_dir: Path, sid: str, files: list, total: int, entries: list,
-               progress, participant_id: str, extra_info: dict | None) -> None:
+               progress, extra_info: dict | None) -> None:
     done = 0
     with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
         for f in files:
@@ -129,7 +129,6 @@ def _write_zip(tmp: Path, session_dir: Path, sid: str, files: list, total: int, 
 
         manifest = {
             "format": EXPORT_FORMAT,
-            "participant_id": participant_id,
             "session_id": sid,
             "recorder_version": __version__,
             "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

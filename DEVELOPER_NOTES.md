@@ -27,7 +27,7 @@ GUI (Tk) / CLI ──► recorder.py ── active_session.json ──┐
      │                 ▼                                ▼
      │      dedicated Chrome/Edge  ◄── extension ──► host.py (native messaging)
      │      (--user-data-dir)          (MV3)            writes the session folder
-     └──► export.py ── <participant>_<session>.zip ──► server/ingest.py ──► sessions/<id>_<participant>
+     └──► export.py ── <session>.zip ──► server/ingest.py ──► sessions/<session>
 ```
 
 - **The recording browser** is a dedicated persistent profile per browser, `<app_dir>/profiles/<chrome|edge>`.

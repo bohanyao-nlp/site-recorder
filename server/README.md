@@ -1,6 +1,6 @@
 # Ingesting participant recordings (server side)
 
-Participants send `<participant>_<YYYYMMDD_HHMMSS>.zip` files exported by SITE Recorder. Run the ingest
+Participants send `<YYYYMMDD_HHMMSS>.zip` files exported by SITE Recorder. Run the ingest
 step from a checkout of the site-bench repo, so it can use that repo's video, caption and summary code.
 This example assumes this repo (site-recorder) is checked out next to it:
 
@@ -13,10 +13,8 @@ For each zip, the ingest step:
 1. **Verifies** every file against the SHA-256 checksums in the zip's `export_manifest.json`. Truncated or
    damaged transfers are rejected; ask the participant to send that file again.
 2. **Extracts** the session into `sessions/.incoming/` (zip-slip safe), then moves it to
-   `sessions/<YYYYMMDD_HHMMSS>_<participant>`.
-   - The participant suffix keeps two participants who started recording in the same second apart.
-   - The folder name keys the batch workspace, resume and library provenance downstream.
-   - Existing folders are never overwritten unless you pass `--force`.
+   `sessions/<YYYYMMDD_HHMMSS>` (the session id, the same folder name `site-bench record` uses).
+   Existing folders are never overwritten unless you pass `--force`.
 3. **Normalizes** the session:
    - converts the `saved_path` entries in the download/local-file manifests to forward slashes (Windows
      participants produce backslashes);
@@ -66,6 +64,6 @@ The recorder also adds:
 
 | File | Contents |
 |---|---|
-| `session_info.json` | Participant, recorder/browser/OS versions, start/end, status, counts. |
+| `session_info.json` | Recorder/browser/OS versions, start/end, status, counts. |
 | `recorder_trace.log` | Lifecycle trace, for diagnosing empty sessions. |
 | `export_manifest.json` | Written inside the zip. |

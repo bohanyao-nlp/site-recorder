@@ -300,7 +300,7 @@ class Recorder:
         """Problems that would make a recording come out empty (user-facing)."""
         problems = []
         if not self.cfg.is_configured:
-            problems.append("Setup is not finished (participant ID and browser).")
+            problems.append("Setup is not finished (choose a browser).")
             return problems
         b = self.cfg.browser
         if not browsers.find_executable(b):
@@ -319,7 +319,7 @@ class Recorder:
         st = browsers.extension_state(b)
         if not st["installed"]:
             problems.append("The SITE Collector extension is not installed in the recording browser "
-                            "(Setup → step 3).")
+                            "(Setup → step 2).")
         elif not st["enabled"]:
             problems.append("The SITE Collector extension is disabled in the recording browser"
                             + (" because Developer mode was turned off — Setup → 'Use the bundled "
@@ -384,7 +384,7 @@ class Recorder:
             else:
                 browsers.launch(b, None, log_file=log)
         except Exception as e:
-            write_session_info(session_dir, self.cfg, status="empty", note=f"browser failed to start: {e}")
+            write_session_info(session_dir, status="empty", note=f"browser failed to start: {e}")
             raise RecorderError(f"Could not start {browsers.DISPLAY_NAME[b]}: {e}") from e
 
         marker["state"] = "recording"
@@ -492,13 +492,11 @@ def _stop_unlocked(*, close_browser: bool, reason: str, cfg: Config | None,
     return session_dir
 
 
-def write_session_info(session_dir: Path, cfg: Config | None, **kw) -> dict:
+def write_session_info(session_dir: Path, **kw) -> dict:
     info = read_json(session_dir / "session_info.json") or {}
     info.update({k: v for k, v in kw.items() if v is not None})
     info.setdefault("session_id", session_dir.name)
     info["recorder_version"] = __version__
-    if cfg is not None:
-        info.setdefault("participant_id", cfg.participant_id)
     atomic_write_json(session_dir / "session_info.json", info, indent=2)
     return info
 
@@ -542,7 +540,7 @@ def finalize(session_dir: Path, cfg: Config | None = None, *, reason: str = "",
         except OSError:
             pass
     info = write_session_info(
-        session_dir, cfg,
+        session_dir,
         status=status, note=note, end_reason=reason,
         started_at=started_at,
         ended_at=ended_at,
@@ -564,7 +562,7 @@ def finalize(session_dir: Path, cfg: Config | None = None, *, reason: str = "",
     except OSError:
         pass
     # Cached for the session list (rescanning big folders is slow).
-    info = write_session_info(session_dir, cfg, size_bytes=dir_size(session_dir))
+    info = write_session_info(session_dir, size_bytes=dir_size(session_dir))
     return info
 
 

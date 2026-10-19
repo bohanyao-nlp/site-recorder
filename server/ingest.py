@@ -12,16 +12,14 @@ PATH may be a .zip or a folder of .zip files. For each zip:
   2. extract (zip-slip safe) into <sessions-root>/.incoming/
   3. normalize: forward-slash relative paths in the download/local-file
      manifests, drop recorder plumbing, make sure metadata.json has a start_url
-  4. move into <sessions-root>/<YYYYMMDD_HHMMSS>_<participant> — refusing to
-     overwrite; the participant suffix keeps sessions of different
-     participants that started in the same second apart (the folder name keys
-     the batch workspace, resume and library provenance downstream)
+  4. move into <sessions-root>/<YYYYMMDD_HHMMSS> (the session id, the same
+     folder name `site-bench record` uses) — refusing to overwrite
   5. post-process exactly like `site-bench record` does at the end of a
      session: browser_recording.mp4, captions (Claude Code / Codex login),
      summary.json — skippable with --skip-video / --skip-label
 
-Already-ingested zips are skipped (matched by the manifest's participant +
-session id), so re-running over a folder of zips is safe.
+Already-ingested zips are skipped (matched by session id), so re-running over
+a folder of zips is safe.
 """
 from __future__ import annotations
 
@@ -30,7 +28,6 @@ import importlib.util
 import json
 import math
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -65,7 +62,6 @@ def _load_export_module():
 
 
 EXPORT = _load_export_module()
-SAFE = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def log(msg: str) -> None:
@@ -83,7 +79,7 @@ def _already_ingested(root: Path) -> dict:
         for line in p.read_text(encoding="utf-8").splitlines():
             try:
                 d = json.loads(line)
-                out[(d["participant_id"], d["session_id"])] = d
+                out[d["session_id"]] = d
             except (ValueError, KeyError):
                 pass
     return out
@@ -229,16 +225,15 @@ def ingest_zip(zip_path: Path, root: Path, args, seen: dict) -> str:
     if not ok:
         log(f"REJECTED {zip_path.name}: {msg}")
         return "rejected"
-    pid = SAFE.sub("-", manifest.get("participant_id") or "anon").strip("-") or "anon"
     sid = manifest["session_id"]
-    if (pid, sid) in seen and not args.force:
-        log(f"skip {zip_path.name}: already ingested as {seen[(pid, sid)].get('folder')}")
+    if sid in seen and not args.force:
+        log(f"skip {zip_path.name}: already ingested as {seen[sid].get('folder')}")
         return "skipped"
-    final = root / f"{sid}_{pid}"
+    final = root / sid
     if final.exists() and (final / ".ingest_pending").exists() and not args.force:
         # A previous run was interrupted during post-processing: resume it.
         log(f"resuming post-processing of {final.name}")
-        return _postprocess_and_record(final, zip_path, pid, sid, root, args, seen, msg="resumed")
+        return _postprocess_and_record(final, zip_path, sid, root, args, seen, msg="resumed")
     if final.exists():
         if not args.force:
             log(f"skip {zip_path.name}: {final} already exists (use --force to replace)")
@@ -261,10 +256,10 @@ def ingest_zip(zip_path: Path, root: Path, args, seen: dict) -> str:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     log(f"ingested {zip_path.name} -> {final} ({msg})")
-    return _postprocess_and_record(final, zip_path, pid, sid, root, args, seen, msg=msg)
+    return _postprocess_and_record(final, zip_path, sid, root, args, seen, msg=msg)
 
 
-def _postprocess_and_record(final: Path, zip_path: Path, pid: str, sid: str, root: Path,
+def _postprocess_and_record(final: Path, zip_path: Path, sid: str, root: Path,
                             args, seen: dict, msg: str) -> str:
     problems = postprocess(final, video=not args.skip_video, label=not args.skip_label,
                            model=args.model, agent=args.agent)
@@ -274,10 +269,10 @@ def _postprocess_and_record(final: Path, zip_path: Path, pid: str, sid: str, roo
         pass
     for p in problems:
         log(f"  ! {p}")
-    entry = {"participant_id": pid, "session_id": sid, "folder": final.name,
+    entry = {"session_id": sid, "folder": final.name,
              "zip": str(zip_path), "ingested_at": time.time(), "problems": problems}
     _record_ingest(root, entry)
-    seen[(pid, sid)] = entry
+    seen[sid] = entry
     return "ok" if not problems else "ok-with-problems"
 
 

@@ -31,14 +31,14 @@ def _fake_session(root: Path, sid: str = "20260102_101010") -> Path:
 
 def test_export_and_verify(tmp_path):
     sd = _fake_session(tmp_path / "sessions")
-    out = export.export_session(sd, tmp_path / "exports", participant_id="P07")
-    assert out.name == "P07_20260102_101010.zip"
+    out = export.export_session(sd, tmp_path / "exports")
+    assert out.name == "20260102_101010.zip"
     ok, msg, manifest = export.verify_zip(out)
     assert ok, msg
     names = zipfile.ZipFile(out).namelist()
     assert "20260102_101010/control.json" not in names
     assert "20260102_101010/export_manifest.json" in names
-    assert manifest["participant_id"] == "P07"
+    assert "participant_id" not in manifest
     assert export.export_info(sd)["zip"] == str(out)
     assert not list((tmp_path / "exports").glob("*.partial"))
     s = sessions.summarize(sd)
@@ -47,7 +47,7 @@ def test_export_and_verify(tmp_path):
 
 def test_verify_detects_tampering(tmp_path):
     sd = _fake_session(tmp_path / "sessions")
-    out = export.export_session(sd, tmp_path / "exports", participant_id="P07")
+    out = export.export_session(sd, tmp_path / "exports")
     bad = tmp_path / "bad.zip"
     with zipfile.ZipFile(out) as zin, zipfile.ZipFile(bad, "w") as zout:
         for i in zin.infolist():
@@ -71,12 +71,12 @@ def _load_ingest():
 
 def test_ingest(tmp_path):
     sd = _fake_session(tmp_path / "sessions_client")
-    z = export.export_session(sd, tmp_path / "exports", participant_id="P07")
+    z = export.export_session(sd, tmp_path / "exports")
     ingest = _load_ingest()
     root = tmp_path / "server_sessions"
     rc = ingest.main([str(z), "--sessions-root", str(root), "--skip-video", "--skip-label"])
     assert rc == 0
-    final = root / "20260102_101010_P07"
+    final = root / "20260102_101010"
     assert (final / "archive" / "session.warc.gz").exists()
     assert not (final / "export_manifest.json").exists() or True
     dl = json.loads((final / "downloads" / "downloads.jsonl").read_text().splitlines()[0])
@@ -89,7 +89,7 @@ def test_ingest(tmp_path):
 
 def test_ingest_rejects_corrupt(tmp_path):
     sd = _fake_session(tmp_path / "s")
-    z = export.export_session(sd, tmp_path / "e", participant_id="P1")
+    z = export.export_session(sd, tmp_path / "e")
     z.write_bytes(z.read_bytes()[:200])
     ingest = _load_ingest()
     assert ingest.main([str(z), "--sessions-root", str(tmp_path / "root"), "--skip-video", "--skip-label"]) == 2
@@ -114,7 +114,7 @@ def _rewrite_zip(src, dst, mutate_manifest=None, extra=None, rename_root=None):
 @pytest.mark.parametrize("case", ["traversal_id", "root_mismatch", "unlisted_file"])
 def test_verify_rejects_crafted_zips(tmp_path, case):
     sd = _fake_session(tmp_path / "s")
-    z = export.export_session(sd, tmp_path / "e", participant_id="P1")
+    z = export.export_session(sd, tmp_path / "e")
     bad = tmp_path / "bad.zip"
     if case == "traversal_id":
         _rewrite_zip(z, bad, mutate_manifest=lambda m: m.update(session_id="../../evil"))
@@ -128,17 +128,17 @@ def test_verify_rejects_crafted_zips(tmp_path, case):
 
 def test_ingest_resumes_pending_postprocess(tmp_path, monkeypatch):
     sd = _fake_session(tmp_path / "c")
-    z = export.export_session(sd, tmp_path / "e", participant_id="P07")
+    z = export.export_session(sd, tmp_path / "e")
     ingest = _load_ingest()
     root = tmp_path / "root"
     calls = []
     monkeypatch.setattr(ingest, "postprocess", lambda s, **k: calls.append(s.name) or [])
     assert ingest.main([str(z), "--sessions-root", str(root), "--skip-video", "--skip-label"]) == 0
-    final = root / "20260102_101010_P07"
+    final = root / "20260102_101010"
     assert not (final / ".ingest_pending").exists()
     # simulate an interrupted post-process: pending marker, no ledger entry
     (final / ".ingest_pending").write_text("x")
     (root / ".incoming" / "ingested.jsonl").unlink()
     assert ingest.main([str(z), "--sessions-root", str(root), "--skip-video", "--skip-label"]) == 0
-    assert calls == ["20260102_101010_P07", "20260102_101010_P07"]
+    assert calls == ["20260102_101010", "20260102_101010"]
     assert not (final / ".ingest_pending").exists()

@@ -2,7 +2,7 @@
 
 Everything the window (``site-recorder gui``) does is also available here:
 
-    site-recorder setup               first-time setup (participant id, browser, extension)
+    site-recorder setup               first-time setup (browser, extension)
     site-recorder start               record until the recording browser is closed / Ctrl+C
     site-recorder stop                stop the recording started elsewhere (e.g. by the app)
     site-recorder pause | resume
@@ -38,8 +38,7 @@ def _print_problems(problems: list[str]) -> None:
 
 
 def cmd_setup(args) -> int:
-    return setup.interactive_setup(participant=args.participant, browser=args.browser,
-                                   noninteractive=args.yes)
+    return setup.interactive_setup(browser=args.browser, noninteractive=args.yes)
 
 
 def cmd_start(args) -> int:
@@ -144,7 +143,7 @@ def cmd_pause(args, paused: bool) -> int:
 def cmd_status(args) -> int:
     cfg = _cfg()
     print(f"site-recorder {__version__}")
-    print(f"  participant: {cfg.participant_id or '(not set)'}   browser: {cfg.browser or '(not set)'}")
+    print(f"  browser: {cfg.browser or '(not set)'}")
     m = recorder.active_session()
     if not m:
         print("  not recording")
@@ -178,9 +177,6 @@ def cmd_list(args) -> int:
 
 def cmd_export(args) -> int:
     cfg = _cfg()
-    if not cfg.participant_id:
-        print("Set your participant ID first: site-recorder setup")
-        return 1
     m = recorder.active_session()
     active = m.get("session_id") if m else None
     rows = sessions.list_sessions(cfg.sessions_path, active)
@@ -198,7 +194,7 @@ def cmd_export(args) -> int:
     dest = Path(args.dest).expanduser() if args.dest else paths.exports_dir()
     for s in rows:
         print(f"Exporting {s.id} ({sessions.human_size(s.size_bytes)})…", flush=True)
-        out = export.export_session(s.path, dest, participant_id=cfg.participant_id)
+        out = export.export_session(s.path, dest)
         print(f"  → {out}")
     print(f"\nSend the .zip file(s) in {dest} to the study team.")
     return 0
@@ -267,7 +263,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("setup", help="first-time setup")
-    s.add_argument("--participant", help="participant ID given to you by the study team")
     s.add_argument("--browser", choices=config.BROWSERS)
     s.add_argument("-y", "--yes", action="store_true", help="non-interactive (use given/default values)")
     s.set_defaults(func=cmd_setup)

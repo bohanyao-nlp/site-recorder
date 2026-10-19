@@ -14,7 +14,7 @@ from site_recorder import browsers, config, export, extinstall, nativehost, path
 browser = sys.argv[1]
 wait_s = float(sys.argv[2]) if len(sys.argv) > 2 and not sys.argv[2].startswith('-') else 70
 cfg = config.load()
-cfg.participant_id, cfg.browser = "e2e01", browser
+cfg.browser = browser
 import testsite
 SRV = testsite.start(8765)
 cfg.start_url = "http://127.0.0.1:8765/a"
@@ -71,6 +71,6 @@ tl = (sd / "tab_timeline.jsonl").read_text().splitlines() if (sd / "tab_timeline
 print("timeline:", [json.loads(l).get("url") for l in tl][:6])
 print("trace:\n" + (sd / "recorder_trace.log").read_text())
 print("host log tail:\n" + "\n".join((sd / "extension_host.log").read_text(encoding="utf-8").splitlines()[-12:]))
-z = export.export_session(sd, paths.exports_dir(), participant_id=cfg.participant_id)
+z = export.export_session(sd, paths.exports_dir())
 print("export:", z.name, export.verify_zip(z)[:2])
 print("active after stop:", recorder.active_session())

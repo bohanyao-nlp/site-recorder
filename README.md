@@ -38,9 +38,8 @@ run the installer again. Your existing recordings won't be affected.
 
 ## 2. One-time setup (in the app's *Setup* tab)
 
-1. **Participant ID**: enter the ID I gave you.
-2. **Browser**: pick Chrome or Edge.
-3. [**Install the SITE Collector extension**](https://chromewebstore.google.com/detail/site-collector/gbhaoocbgjdighlaaflhgfbmaahgmjaa).
+1. **Browser**: pick Chrome or Edge.
+2. [**Install the SITE Collector extension**](https://chromewebstore.google.com/detail/site-collector/gbhaoocbgjdighlaaflhgfbmaahgmjaa).
 
    *If the Web Store link doesn't work:* click *Use the bundled copy*. The app turns on Developer mode
    and opens the extensions page for you. Then:
@@ -48,7 +47,7 @@ run the installer again. Your existing recordings won't be affected.
    - paste the folder path (it's already copied to your clipboard).
 
    Leave Developer mode on. If Edge shows a "Turn off developer mode?" notice, close it with the **X**.
-4. *(Optional)* Click *Open recording browser (not recorded)* and log in to any sites you plan to use.
+3. *(Optional)* Click *Open recording browser (not recorded)* and log in to any sites you plan to use.
    The recording browser starts out with no logins, and it keeps the ones you add here.
 
 ## 3. Record

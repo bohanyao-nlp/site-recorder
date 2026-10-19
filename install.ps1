@@ -128,7 +128,7 @@ uv tool update-shell 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail 'post-install step failed (see above).' }
 
 Say ''
-Say 'Installed. Next: finish setup in the app (participant ID, browser, extension).'
+Say 'Installed. Next: finish setup in the app (browser, extension).'
 Say "Start it any time from the Start menu or desktop: 'SITE Recorder'."
 if (-not $env:SITE_RECORDER_NO_LAUNCH) {
     Say 'Opening SITE Recorder...'

@@ -110,7 +110,7 @@ fi
 "$TOOL_PY" -m site_recorder.cli post-install || fail "post-install step failed (see above)."
 
 say ""
-say "Installed. Next: finish setup in the app (participant ID, browser, extension)."
+say "Installed. Next: finish setup in the app (browser, extension)."
 case "$(uname -s)" in
   Darwin) say "The app is in ~/Applications/SITE Recorder.app (also: run 'site-recorder')." ;;
   *)      say "Find 'SITE Recorder' in your applications menu (also: run 'site-recorder')." ;;
